@@ -1872,6 +1872,13 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // diagnostics: log the MoE cache hit rate every 1000 decode calls (the destructor log is lost on a forced stop)
+    if (moe_cache) {
+        static int n_decode_calls = 0;
+        if (++n_decode_calls % 1000 == 0) {
+            moe_cache->log_stats();
+        }
+    }
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

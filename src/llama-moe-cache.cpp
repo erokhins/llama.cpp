@@ -1576,3 +1576,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
     }
     return res;
 }
+
+void llama_moe_cache::log_stats() {
+    pimpl->log_stats();
+}

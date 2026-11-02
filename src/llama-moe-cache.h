@@ -79,6 +79,9 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // diagnostics: log hit/miss statistics now (normally only logged at destruction)
+    void log_stats();
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
