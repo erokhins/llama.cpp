@@ -375,6 +375,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool record_experts_installed = false; // LLAMA_RECORD_EXPERTS, installed at the first decode (not in measurement contexts)
 
     // phase-aware workspace (cparams.phase_aware_workspace): tokens the compute buffers are reserved for, and the streak of
     // decode-sized batches seen since the last full reservation

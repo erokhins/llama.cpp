@@ -509,8 +509,11 @@ struct llama_moe_cache::impl {
     bool device_lookup = false; // requested, see LLAMA_MOE_CACHE_DEVICE; each group then checks its device
     std::vector<std::pair<void (*)(void *), void *>> mapped; // host buffers mapped by the cache, with the function that unmaps them
 
+    bool measuring = false; // constructed for a memory measurement (no_alloc): no real buffers
+
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+        measuring = no_alloc;
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -789,6 +792,12 @@ struct llama_moe_cache::impl {
             }
         }
         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        // diagnostics [LLAMA_MOE_CACHE_PRELOAD=path]: admit the (int32 layer, int32 expert) pairs of the file in order, least
+        // important first, so the cache starts warm with a chosen set instead of empty
+        if (!no_alloc && getenv("LLAMA_MOE_CACHE_PRELOAD")) {
+            preload(getenv("LLAMA_MOE_CACHE_PRELOAD"));
+        }
 
         for (size_t id = 0; id < devices.size(); ++id) {
             const device & d = devices[id];
@@ -1431,7 +1440,91 @@ struct llama_moe_cache::impl {
         return std::any_of(seed_counts.begin(), seed_counts.end(), [](const std::vector<int32_t> & c) { return !c.empty(); });
     }
 
+    void preload(const char * path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            LLAMA_LOG_WARN("%s: cannot open %s\n", __func__, path);
+            return;
+        }
+        std::vector<moe_cache_lru::fill> fills;
+        size_t n_hit = 0, n_pairs = 0, n_loaded = 0, n_skipped = 0;
+        int32_t pair[2];
+        while (f.read((char *) pair, sizeof(pair))) {
+            n_pairs++;
+            const int32_t il = pair[0], e = pair[1];
+            if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+                n_skipped++;
+                continue;
+            }
+            group & g = groups[layers[il].ig];
+            if (e < 0 || e >= g.ref[0]->ne[2] || !g.lru.plan(il, &e, 1, fills, n_hit)) {
+                n_skipped++;
+                continue;
+            }
+            ggml_backend_t backend = devices[g.id].backend;
+            for (const moe_cache_lru::fill & fl : fills) {
+                for (size_t ip = 0; ip < layers[il].experts.size(); ++ip) {
+                    const ggml_tensor * w = layers[il].experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + fl.expert*expert_size, fl.slot*expert_size, expert_size);
+                }
+                n_loaded++;
+            }
+        }
+        for (group & g : groups) {
+            if (g.dev_lookup && g.n_slots > 0) {
+                upload(g);
+            }
+        }
+        LLAMA_LOG_INFO("%s: %zu pairs read, %zu experts loaded into the cache, %zu skipped\n", __func__, n_pairs, n_loaded, n_skipped);
+    }
+
+    // diagnostics [LLAMA_MOE_CACHE_DUMP=path]: append the resident set, one record of int32 {n} then n x {layer, expert}
+    void dump_resident(const char * path) {
+        if (measuring) {
+            return; // a memory measurement has dummy buffers
+        }
+        FILE * f = fopen(path, "ab");
+        if (!f) {
+            return;
+        }
+        std::vector<int32_t> pairs;
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const int64_t n_expert = g.ref[0]->ne[2];
+            if (g.dev_lookup && g.map != nullptr && g.map->data != nullptr) {
+                ggml_backend_synchronize(devices[g.id].backend);
+                std::vector<int32_t> m(ggml_nelements(g.map));
+                ggml_backend_tensor_get(g.map, m.data(), 0, ggml_nbytes(g.map));
+                for (int32_t il : g.layers) {
+                    for (int64_t e = 0; e < n_expert; ++e) {
+                        if (m[il*n_expert + e] >= 0) {
+                            pairs.push_back(il); pairs.push_back((int32_t) e);
+                        }
+                    }
+                }
+            } else {
+                for (int32_t il : g.layers) {
+                    for (int64_t e = 0; e < n_expert; ++e) {
+                        if (g.lru.slot_map[il][e] >= 0) {
+                            pairs.push_back(il); pairs.push_back((int32_t) e);
+                        }
+                    }
+                }
+            }
+        }
+        const int32_t n = (int32_t) (pairs.size()/2);
+        fwrite(&n, sizeof(n), 1, f);
+        fwrite(pairs.data(), sizeof(int32_t), pairs.size(), f);
+        fclose(f);
+    }
+
     void log_stats() {
+        if (const char * dump = getenv("LLAMA_MOE_CACHE_DUMP")) {
+            dump_resident(dump);
+        }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {

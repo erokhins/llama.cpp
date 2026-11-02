@@ -234,6 +234,7 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+
     cparams.ctx_other = nullptr;
 
     // TODO: more generic
@@ -2026,6 +2027,35 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
+
+    // diagnostics [LLAMA_RECORD_EXPERTS=path]: append the routed expert ids of every MoE layer (ffn_moe_topk) to a file,
+    // records of int32 {layer, n_used, n_tokens} followed by n_used*n_tokens ids
+    if (cparams.cb_eval == nullptr && !record_experts_installed && getenv("LLAMA_RECORD_EXPERTS")) {
+        record_experts_installed = true;
+        static FILE * record_file = fopen(getenv("LLAMA_RECORD_EXPERTS"), "ab");
+        if (record_file) {
+            cparams.cb_eval = [](ggml_tensor * t, bool ask, void * ud) -> bool {
+                FILE * f = (FILE *) ud;
+                const bool topk = strncmp(t->name, "ffn_moe_topk-", 13) == 0;
+                if (ask) {
+                    return topk;
+                }
+                if (!topk || t->type != GGML_TYPE_I32 || t->ne[2] != 1) {
+                    return true;
+                }
+                const int32_t hdr[3] = { atoi(t->name + 13), (int32_t) t->ne[0], (int32_t) t->ne[1] };
+                std::vector<int32_t> buf((size_t) t->ne[0]*t->ne[1]);
+                for (int64_t j = 0; j < t->ne[1]; ++j) {
+                    ggml_backend_tensor_get(t, buf.data() + j*t->ne[0], j*t->nb[1], t->ne[0]*sizeof(int32_t));
+                }
+                fwrite(hdr, sizeof(hdr), 1, f);
+                fwrite(buf.data(), sizeof(int32_t), buf.size(), f);
+                return true;
+            };
+            cparams.cb_eval_user_data = record_file;
+            LLAMA_LOG_WARN("%s: recording routed experts to %s (slower, the graph is evaluated per MoE layer)\n", __func__, getenv("LLAMA_RECORD_EXPERTS"));
+        }
+    }
 
     // phase-aware workspace: the compute buffer follows the phase. A batch larger than the current reservation brings
     // the full reservation back (prompt); after a streak of decode-sized batches the scheduler is rebuilt for decode only
