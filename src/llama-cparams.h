@@ -53,6 +53,7 @@ struct llama_cparams {
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
+    bool phase_aware_workspace; // keep the compute buffer sized for decode between prompts (see llama_context::sched_reserve_decode)
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()

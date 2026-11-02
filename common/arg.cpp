@@ -2966,6 +2966,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--phase-aware-workspace"},
+        string_format("keep the compute buffers sized for decode between prompts, freeing their VRAM; a prompt reserves them again (default: %s)", params.phase_aware_workspace ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.phase_aware_workspace = true;
+        }
+    ).set_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE"));
+    add_opt(common_arg(
         {"--op-offload"},
         {"--no-op-offload"},
         string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),

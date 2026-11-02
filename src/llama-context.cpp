@@ -368,6 +368,7 @@ llama_context::llama_context(
     }
 
     cparams.op_offload     = params.op_offload;
+    cparams.phase_aware_workspace = params.phase_aware_workspace;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
@@ -750,6 +751,57 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     }
 }
 
+void llama_context::sched_reserve_decode() {
+    LLAMA_LOG_INFO("%s: phase-aware workspace: reserving the compute workspace for decode batches of up to %u tokens\n", __func__, workspace_decode_n_tokens);
+
+    synchronize();
+
+    const int64_t t_start_us = ggml_time_us();
+
+    const uint32_t n_seqs   = cparams.n_seq_max;
+    const uint32_t n_tokens = std::min(std::min(cparams.n_ctx, cparams.n_ubatch), std::max(workspace_decode_n_tokens, n_seqs));
+
+    // the node budget of the full reservation, so the scheduler can still take a prompt graph before the full reservation returns
+    const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    gf_res_prev_active = nullptr;
+
+    // a new scheduler drops the old compute buffers; the reservation below allocates them for the decode graph only
+    sched_new(max_nodes, cparams.pipeline_parallel);
+
+    llama_memory_context_ptr mctx;
+    if (memory) {
+        mctx = memory->init_full();
+        if (!mctx) {
+            throw std::runtime_error("failed to initialize memory module");
+        }
+    }
+
+    resolve_fused_ops(mctx.get(), n_seqs);
+
+    auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.no_alloc());
+    if (!gf) {
+        throw std::runtime_error("failed to allocate the decode compute buffers");
+    }
+
+    workspace_n_tokens     = n_tokens;
+    workspace_small_streak = 0;
+
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        ggml_backend_t             backend = backend_ptrs[i];
+        ggml_backend_buffer_type_t buft    = backend_buft[i];
+        const size_t size = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        if (size > 1) {
+            LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__, ggml_backend_buft_name(buft), size / 1024.0 / 1024.0);
+        }
+    }
+    LLAMA_LOG_INFO("%s: took %.2f ms\n", __func__, (ggml_time_us() - t_start_us) / 1000.0);
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -901,6 +953,9 @@ void llama_context::sched_reserve() {
     }
 
     const int64_t t_end_us = ggml_time_us();
+
+    workspace_n_tokens     = n_tokens;
+    workspace_small_streak = 0;
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
@@ -1971,6 +2026,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
+
+    // phase-aware workspace: the compute buffer follows the phase. A batch larger than the current reservation brings
+    // the full reservation back (prompt); after a streak of decode-sized batches the scheduler is rebuilt for decode only
+    if (cparams.phase_aware_workspace && !cparams.training) {
+        static const int hysteresis = getenv("LLAMA_PAW_HYSTERESIS") ? std::max(1, atoi(getenv("LLAMA_PAW_HYSTERESIS"))) : 8;
+        if (n_tokens_all > workspace_n_tokens) {
+            LLAMA_LOG_INFO("%s: phase-aware workspace: batch of %u tokens, reserving the full compute workspace again\n", __func__, n_tokens_all);
+            sched_need_reserve = true;
+        } else if (n_tokens_all <= workspace_decode_n_tokens && workspace_n_tokens > workspace_decode_n_tokens) {
+            if (++workspace_small_streak >= hysteresis) {
+                sched_reserve_decode();
+            }
+        }
+    }
 
     sched_reserve();
 
@@ -4285,6 +4354,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.phase_aware_workspace       =*/ false,
     };
 
     return result;

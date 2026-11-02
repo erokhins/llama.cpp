@@ -58,6 +58,9 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // phase-aware workspace: rebuild the scheduler with compute buffers for decode-sized batches only
+    void sched_reserve_decode();
+
     void synchronize();
 
     const llama_model   & get_model()   const;
@@ -372,6 +375,12 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // phase-aware workspace (cparams.phase_aware_workspace): tokens the compute buffers are reserved for, and the streak of
+    // decode-sized batches seen since the last full reservation
+    static constexpr uint32_t workspace_decode_n_tokens = 32; // the MoE cache's small-batch limit, covers speculative verifies
+    uint32_t workspace_n_tokens     = 0;
+    int      workspace_small_streak = 0;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
