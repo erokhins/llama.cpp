@@ -571,12 +571,13 @@ struct llama_moe_cache::impl {
             return;
         }
 
-        // one extra slot at the end, CUDA MMQ can read past the last expert
+        // extra slots at the end: n_expert_used zero experts (slots n_slots + rank, kept zero; a skipped or deferred expert of a token points at
+        // the one of its rank, so a token never repeats a slot, which the MMQ id helper assumes) and the padding CUDA MMQ may read past the last expert
         auto alloc_size = [&](const group & g, int32_t n_slots) {
             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
             size_t res = 0;
             for (const ggml_tensor * t : g.ref) {
-                res += GGML_PAD(t->nb[2]*(n_slots + 1), alignment);
+                res += GGML_PAD(t->nb[2]*(n_slots + n_expert_used + 1), alignment);
             }
             return res;
         };
@@ -684,7 +685,7 @@ struct llama_moe_cache::impl {
             }
             ggml_context * ctx = devices[g.id].ctx.get();
             for (const ggml_tensor * t : g.ref) {
-                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + 1);
+                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + n_expert_used + 1);
                 GGML_ASSERT(bank->nb[2] == t->nb[2]);
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
@@ -695,7 +696,8 @@ struct llama_moe_cache::impl {
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
-                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
+                    // the view includes the zero experts, so every slot a lookup can produce is inside the matmul's expert range
+                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_expert_used, bank->nb[1], bank->nb[2], 0);
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
                 }
@@ -846,7 +848,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_expert_used, n_tokens);
         std::vector<const void *> host(g.banks.size(), nullptr);
         std::vector<ggml_tensor *> banks = g.banks;
-        ggml_tensor * op = ggml_moe_cache_lookup(ctx.get(), ids, g.map, g.state, banks.data(), host.data(), (int) banks.size(), g.layers[0]);
+        ggml_tensor * op = ggml_moe_cache_lookup(ctx.get(), ids, g.map, g.state, banks.data(), host.data(), (int) banks.size(), g.layers[0], 0, 0);
         return ggml_backend_supports_op(backend, op);
     }
 
@@ -990,7 +992,28 @@ struct llama_moe_cache::impl {
         }
         std::vector<ggml_tensor *> banks = g.banks;
         std::vector<const void *>  host  = l.host_dev;
-        return ggml_moe_cache_lookup(ctx, ids, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il);
+        return ggml_moe_cache_lookup(ctx, ids, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il, tail_skip_rank(), split_fetch() ? 1 : 0);
+    }
+
+    // LLAMA_MOE_CACHE_SPLIT=1: the expert matmuls of the resident experts run while the missing ones are copied (Strata's "hits first"),
+    // then the missing experts are computed and added; the outputs are the same, only the order changes
+    bool split_fetch() const {
+        static const bool on = [] {
+            const char * env = getenv("LLAMA_MOE_CACHE_SPLIT");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        return on;
+    }
+
+    // LLAMA_MOE_CACHE_TAIL_SKIP=R (default 0 = off, Strata's STRATA_ROUTE_TAIL_SKIP uses 7): a missing expert that every token of
+    // the ubatch routes at rank R or lower (the smallest router weights) is neither fetched nor computed; it contributes zero and
+    // the other weights are not renormalised. Fewer PCIe copies and evictions, at a small change of the output.
+    int tail_skip_rank() const {
+        static const int rank = [] {
+            const char * env = getenv("LLAMA_MOE_CACHE_TAIL_SKIP");
+            return env != nullptr ? atoi(env) : 0;
+        }();
+        return rank > 0 && rank < (int) n_expert_used ? rank : 0;
     }
 
     // header of the device state, see ggml_moe_cache_lookup
@@ -1525,6 +1548,7 @@ struct llama_moe_cache::impl {
         if (const char * dump = getenv("LLAMA_MOE_CACHE_DUMP")) {
             dump_resident(dump);
         }
+        uint64_t n_skipped = 0;
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {
@@ -1541,13 +1565,17 @@ struct llama_moe_cache::impl {
                 if (!g.dev_lookup || g.n_slots == 0 || g.state == nullptr || g.state->data == nullptr) {
                     continue;
                 }
-                uint64_t cnt[2] = { 0, 0 };
+                uint64_t cnt[3] = { 0, 0, 0 };
                 ggml_backend_tensor_get(g.state, cnt, 2*sizeof(int32_t), sizeof(cnt));
                 st.hits   += cnt[0];
                 st.misses += cnt[1];
                 st.bytes  += cnt[1]*g.expert_bytes;
+                n_skipped += cnt[2];
             }
             log("device lookups (ubatch <= 32)", st);
+            if (n_skipped > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: device lookups: %zu missing tail experts skipped (LLAMA_MOE_CACHE_TAIL_SKIP=%d)\n", (size_t) n_skipped, tail_skip_rank());
+            }
         }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
@@ -1672,4 +1700,8 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
 
 void llama_moe_cache::log_stats() {
     pimpl->log_stats();
+}
+
+bool llama_moe_cache::split_fetch() const {
+    return pimpl->split_fetch();
 }

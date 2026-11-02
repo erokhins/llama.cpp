@@ -29,7 +29,7 @@ static __device__ __forceinline__ int32_t moe_cache_id(const int32_t * ids, cons
 
 static __global__ void moe_cache_assign(
         const int32_t * __restrict__ ids, int32_t * __restrict__ map, int32_t * __restrict__ state, int32_t * __restrict__ dst,
-        const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots) {
+        const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots, const int tail_rank, const int split) {
     extern __shared__ int32_t smem[];
     int32_t * miss_e = smem;         // [n_ids] missing experts, in the order of their first use
     int32_t * victim = smem + n_ids; // [n_ids] slots given to them
@@ -42,9 +42,10 @@ static __global__ void moe_cache_assign(
     int32_t * pin    = ref + n_slots;
     int32_t * row    = map + (int64_t) il*n_expert;
 
-    int32_t * slots  = dst;
-    int32_t * n_fill = dst + n_ids;
-    int32_t * fill_e = dst + n_ids + ne0;
+    int32_t * slots  = dst;             // split: the resident experts' slots, the others the zero expert
+    int32_t * miss   = dst + n_ids;     // split: the missing experts' slots, the others the zero expert
+    int32_t * n_fill = dst + 2*n_ids;
+    int32_t * fill_e = dst + 2*n_ids + ne0;
     int32_t * fill_s = fill_e + n_ids;
 
     uint32_t epoch = (uint32_t) state[1] + 1;
@@ -65,6 +66,9 @@ static __global__ void moe_cache_assign(
     for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
         const int32_t s = row[moe_cache_id(ids, i, n_expert)];
         slots[i] = s;
+        if (split) {
+            miss[i] = n_slots + i % ne0; // the zero expert of this rank
+        }
         if (s >= 0) {
             ref[s] = 1;
             if ((uint32_t) atomicExch(&pin[s], (int32_t) epoch) != epoch) {
@@ -74,11 +78,29 @@ static __global__ void moe_cache_assign(
     }
     __syncthreads();
 
+    // tail skip: a missing expert that some token routes at a rank below tail_rank (ids are sorted by descending weight,
+    // the rank is the position within the token) must be fetched, mark it -3; a missing expert left at -1 is skipped
+    if (tail_rank > 0) {
+        for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
+            if (slots[i] < 0 && i % ne0 < tail_rank) {
+                row[moe_cache_id(ids, i, n_expert)] = -3;
+            }
+        }
+        __syncthreads();
+    }
+
     // misses: the first use of each missing expert claims it, in the order of the ids
     int n_miss = 0;
+    int n_skip = 0;
     for (int i0 = 0; i0 < n_ids; i0 += MOE_CACHE_LANES) {
         const int i = i0 + lane;
-        const int32_t e = i < n_ids && slots[i] < 0 ? moe_cache_id(ids, i, n_expert) : -1;
+        int32_t e = i < n_ids && slots[i] < 0 ? moe_cache_id(ids, i, n_expert) : -1;
+        if (tail_rank > 0 && e >= 0 && row[e] == -1) {
+            // skipped: the zero expert of this rank in the extra slots of the banks, nothing is copied (miss[i] is a zero expert already)
+            slots[i] = n_slots + i % ne0;
+            n_skip++;
+            e = -1;
+        }
         bool first = e >= 0;
         for (int k = 0; k < MOE_CACHE_LANES; ++k) {
             const int32_t ek = __shfl_sync(full, e, k, MOE_CACHE_LANES);
@@ -87,7 +109,7 @@ static __global__ void moe_cache_assign(
             }
         }
         // a previous group of ids may have claimed it already
-        first = first && row[e] == -1;
+        first = first && (row[e] == -1 || row[e] == -3);
         const unsigned m = moe_cache_ballot(first);
         if (first) {
             row[e] = -2;
@@ -155,18 +177,26 @@ static __global__ void moe_cache_assign(
 
     for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
         if (slots[i] < 0) {
-            slots[i] = row[moe_cache_id(ids, i, n_expert)];
+            const int32_t s = row[moe_cache_id(ids, i, n_expert)];
+            if (split) {
+                miss[i]  = s;
+                slots[i] = n_slots + i % ne0;
+            } else {
+                slots[i] = s;
+            }
         }
     }
 
     for (int off = MOE_CACHE_LANES/2; off > 0; off >>= 1) {
-        n_hit += __shfl_xor_sync(full, n_hit, off, MOE_CACHE_LANES);
+        n_hit  += __shfl_xor_sync(full, n_hit,  off, MOE_CACHE_LANES);
+        n_skip += __shfl_xor_sync(full, n_skip, off, MOE_CACHE_LANES);
     }
     if (lane == 0) {
         state[0] = h;
         *n_fill  = n_miss;
         *(unsigned long long *) (state + 2) += (unsigned long long) n_hit;
         *(unsigned long long *) (state + 4) += (unsigned long long) n_miss;
+        *(unsigned long long *) (state + 6) += (unsigned long long) n_skip;
     }
 }
 
@@ -181,8 +211,8 @@ struct moe_cache_fetch_args {
 // blocks loop over the items: a lookup without misses costs one small launch instead of n_ids*n_banks*n_chunks idle blocks
 static __global__ void moe_cache_fetch(const int32_t * __restrict__ info, const int n_ids, const int ne0, const moe_cache_fetch_args args,
         const int64_t chunk, const int n_banks, const int n_chunks) {
-    const int32_t * n_fill = info + n_ids;
-    const int32_t * fill_e = info + n_ids + ne0;
+    const int32_t * n_fill = info + 2*n_ids;
+    const int32_t * fill_e = info + 2*n_ids + ne0;
     const int32_t * fill_s = fill_e + n_ids;
 
     const int n_work = (*n_fill)*n_banks*n_chunks;
@@ -229,6 +259,9 @@ static __global__ void moe_cache_fetch(const int32_t * __restrict__ info, const 
 }
 
 bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
+    if (ggml_get_op_params_i32(op, 0) < 0) {
+        return op->src[0] != nullptr && op->src[0]->op == GGML_OP_MOE_CACHE_LOOKUP; // the join
+    }
     const int n_banks = ggml_get_op_params_i32(op, 1);
     if (n_banks < 1 || n_banks > 4) {
         return false;
@@ -238,13 +271,35 @@ bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
         n_ids <= 4096;
 }
 
+// the side stream of a split lookup and the events that fork it off the main stream and join it back
+static constexpr int MOE_CACHE_SIDE_STREAM = GGML_CUDA_MAX_STREAMS - 1;
+
+static cudaEvent_t moe_cache_event(int device, int which) {
+    static cudaEvent_t events[GGML_CUDA_MAX_DEVICES][2] = {};
+    if (events[device][which] == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&events[device][which], cudaEventDisableTiming));
+    }
+    return events[device][which];
+}
+
 void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) < 0) {
+        // join: the main stream waits for the copy of the missing experts
+        if (ctx.moe_fork_open) {
+            CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), moe_cache_event(ctx.device, 1), 0));
+            ctx.moe_fork_open = false;
+        }
+        return;
+    }
+
     const ggml_tensor * ids   = dst->src[0];
     ggml_tensor       * map   = dst->src[1];
     ggml_tensor       * state = dst->src[2];
 
-    const int il      = ggml_get_op_params_i32(dst, 0);
-    const int n_banks = ggml_get_op_params_i32(dst, 1);
+    const int il        = ggml_get_op_params_i32(dst, 0);
+    const int n_banks   = ggml_get_op_params_i32(dst, 1);
+    const int tail_rank = ggml_get_op_params_i32(dst, 2 + 2*4);
+    const int split     = ggml_get_op_params_i32(dst, 2 + 2*4 + 1);
 
     const int n_ids    = (int) ggml_nelements(ids);
     const int ne0      = (int) ids->ne[0];
@@ -261,7 +316,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
 
     moe_cache_assign<<<1, MOE_CACHE_LANES, 2*n_ids*sizeof(int32_t), stream>>>(
         (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
-        n_ids, ne0, n_expert, il, n_slots);
+        n_ids, ne0, n_expert, il, n_slots, tail_rank, split);
     CUDA_CHECK(cudaGetLastError());
 
     moe_cache_fetch_args args = {};
@@ -279,6 +334,18 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
     // enough blocks to keep PCIe busy for a handful of misses (each block has 16 KB of loads in flight), few enough that an
     // empty launch stays at a few microseconds (RTX 5090: 2250 idle blocks cost 17 us per layer, 48 layers per step)
     const int n_blocks = std::min(n_ids*n_banks*n_chunks, 512);
+    if (split) {
+        // fork: the copy runs on the side stream while the main stream computes the resident experts; ggml_moe_cache_join waits for it
+        GGML_ASSERT(!ctx.moe_fork_open && "a split MoE cache lookup was not joined");
+        cudaStream_t side = ctx.stream(ctx.device, MOE_CACHE_SIDE_STREAM);
+        CUDA_CHECK(cudaEventRecord(moe_cache_event(ctx.device, 0), stream));
+        CUDA_CHECK(cudaStreamWaitEvent(side, moe_cache_event(ctx.device, 0), 0));
+        moe_cache_fetch<<<n_blocks, 256, 0, side>>>((const int32_t *) dst->data, n_ids, ne0, args, chunk, n_banks, n_chunks);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(moe_cache_event(ctx.device, 1), side));
+        ctx.moe_fork_open = true;
+        return;
+    }
     moe_cache_fetch<<<n_blocks, 256, 0, stream>>>((const int32_t *) dst->data, n_ids, ne0, args, chunk, n_banks, n_chunks);
     CUDA_CHECK(cudaGetLastError());
 }

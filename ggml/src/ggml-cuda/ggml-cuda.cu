@@ -4894,7 +4894,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
                 // fused nodes are skipped together, so a cut never splits a fusion
                 // a concurrent region must join before its capture can end
-                if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
+                if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active && !cuda_ctx->moe_fork_open) {
                     ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
                     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
                     chunk_end = i + chunk_size;

@@ -1539,7 +1539,15 @@ extern "C" {
             struct ggml_tensor ** banks,
             const void         ** host,
             int                   n_banks,
-            int                   il);
+            int                   il,
+            int                   tail_rank, // > 0: a missing expert that every token routes at this rank or lower is skipped (zero contribution)
+            int                   split);    // 1: the result also holds the slots of the missing experts separately (see the op) and the copy of the
+                                             //    missing experts runs concurrently until ggml_moe_cache_join
+
+    // waits for the concurrent copy started by a split ggml_moe_cache_lookup; place it before the first use of the missing experts' slots
+    GGML_API struct ggml_tensor * ggml_moe_cache_join(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * lookup);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

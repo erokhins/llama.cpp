@@ -3481,8 +3481,12 @@ struct ggml_tensor * ggml_moe_cache_lookup(
         struct ggml_tensor ** banks,
         const void         ** host,
         int                   n_banks,
-        int                   il) {
+        int                   il,
+        int                   tail_rank,
+        int                   split) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && map->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32);
+    GGML_ASSERT(tail_rank >= 0 && tail_rank <= ids->ne[0]);
+    GGML_ASSERT(split == 0 || split == 1);
     GGML_ASSERT(ggml_is_contiguous(ids) && ids->ne[2] == 1 && ids->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(map) && ggml_is_contiguous(state));
     GGML_ASSERT(il >= 0 && il < map->ne[1]);
@@ -3493,17 +3497,21 @@ struct ggml_tensor * ggml_moe_cache_lookup(
     // every distinct expert of the ids needs a slot, otherwise the eviction of the lookup cannot finish
     GGML_ASSERT(MIN(ggml_nelements(ids), map->ne[0]) <= n_slots && "more distinct experts than slots");
     for (int i = 0; i < n_banks; ++i) {
-        GGML_ASSERT(banks[i]->ne[2] == n_slots + 1 && banks[i]->ne[3] == 1);
+        GGML_ASSERT(banks[i]->ne[2] >= n_slots + ids->ne[0] + 1 && banks[i]->ne[3] == 1); // the slots, one zero expert per rank, MMQ's read-past padding
         GGML_ASSERT(ggml_is_contiguous(banks[i]));
     }
 
-    // slots [n_expert_used, n_tokens], then one row with the number of copied experts, then their experts and their slots
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], 3*ids->ne[1] + 1);
+    // slots [n_expert_used, n_tokens] (split: of the resident experts, the others point at the zero expert in the banks' extra slot),
+    // the slots of the missing experts [n_expert_used, n_tokens] (split only, the resident ones point at the zero expert),
+    // then one row with the number of copied experts, then their experts and their slots
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], 4*ids->ne[1] + 1);
 
-    int32_t params[2 + 2*4] = { il, n_banks };
+    int32_t params[2 + 2*4 + 2] = { il, n_banks };
     for (int i = 0; i < n_banks; ++i) {
         memcpy(&params[2 + 2*i], &host[i], sizeof(void *));
     }
+    params[2 + 2*4]     = tail_rank;
+    params[2 + 2*4 + 1] = split;
     static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "op params too large");
     ggml_set_op_params(result, params, sizeof(params));
 
@@ -3514,6 +3522,22 @@ struct ggml_tensor * ggml_moe_cache_lookup(
     for (int i = 0; i < n_banks; ++i) {
         result->src[3 + i] = banks[i];
     }
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_cache_join(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * lookup) {
+    GGML_ASSERT(lookup->op == GGML_OP_MOE_CACHE_LOOKUP);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    const int32_t params[2] = { -1, 0 }; // il = -1 marks the join
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_LOOKUP;
+    result->src[0] = lookup;
 
     return result;
 }

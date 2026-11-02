@@ -1233,7 +1233,9 @@ struct llm_graph_context {
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
-                     int   il) const;
+                     int   il,
+             ggml_tensor ** slots_miss = nullptr, // split lookups: the slots of the missing experts, to be used after *join
+             ggml_tensor ** join       = nullptr) const;
 
     //
     // inputs

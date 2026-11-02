@@ -1530,6 +1530,9 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
+    // a split MoE cache lookup copies the missing experts on a side stream until its join; a graph chunk cannot end in between
+    bool moe_fork_open = false;
+
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);

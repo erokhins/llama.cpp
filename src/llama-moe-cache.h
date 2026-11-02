@@ -29,6 +29,8 @@ public:
     // for small batches: the slots of the experts selected by ids [n_expert_used, n_tokens] in layer il, looked up on the device (which also copies the misses)
     // n_ubatch is the ubatch size, the same for all layers; nullptr if the device lookup is not used, then use get_slot_map
     ggml_tensor * lookup(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch) const;
+    // the lookups split the resident and the missing experts and copy the missing ones concurrently (LLAMA_MOE_CACHE_SPLIT)
+    bool split_fetch() const;
 
     // before computing a ubatch: moves the state of the cache between the host and the devices if the other side uses it
     void prepare(int64_t n_tokens);

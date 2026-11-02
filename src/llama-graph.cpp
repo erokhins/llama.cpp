@@ -2373,7 +2373,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    ggml_tensor * slots_miss = nullptr;
+    ggml_tensor * join       = nullptr;
+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, &slots_miss, &join);
     if (slots != nullptr) {
         // the per-expert scales and biases are read from their device copies, so the layer does not go back to the host
         for (ggml_tensor ** t : { &up_exps_s, &gate_exps_s, &down_exps_s, &up_exps_b, &gate_exps_b, &down_exps_b, &gate_up_exps_b }) {
@@ -2392,6 +2394,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    ggml_tensor * experts = nullptr;
+
+    // the expert chain (gate/up, activation, down) for one set of slots; a split cache lookup runs it twice, for the resident and the
+    // missing experts, and adds the two (the other set's entries point at a zero expert)
+    ggml_tensor * const cur_in = cur;
+    auto run_experts = [&](ggml_tensor * slots) -> ggml_tensor * {
+    ggml_tensor * cur = cur_in;
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
@@ -2550,6 +2559,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
         }
     }
+    return experts;
+    };
+
+    experts = run_experts(slots);
+    if (slots_miss != nullptr) {
+        // the resident experts first, then wait for the copy, then the missing ones
+        ggml_build_forward_expand(gf, experts);
+        ggml_build_forward_expand(gf, join);
+        experts = ggml_add(ctx0, experts, run_experts(slots_miss));
+        cb(experts, "ffn_moe_down_joined", il);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
@@ -2614,7 +2634,9 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * gate_exps,
          ggml_tensor * down_exps,
          ggml_tensor * gate_up_exps,
-                 int   il) const {
+                 int   il,
+         ggml_tensor ** slots_miss,
+         ggml_tensor ** join) const {
     if (moe_cache == nullptr) {
         return nullptr;
     }
@@ -2640,6 +2662,13 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
 
             ggml_tensor * slots = ggml_view_2d(ctx0, res, ids->ne[0], ids->ne[1], res->nb[1], 0); // [n_expert_used, n_tokens]
             cb(slots, "ffn_moe_slots", il);
+            if (slots_miss != nullptr && join != nullptr && moe_cache->split_fetch()) {
+                *slots_miss = ggml_view_2d(ctx0, res, ids->ne[0], ids->ne[1], res->nb[1], ids->ne[1]*res->nb[1]); // [n_expert_used, n_tokens]
+                cb(*slots_miss, "ffn_moe_slots_miss", il);
+                *join = ggml_moe_cache_join(ctx0, res);
+                ggml_backend_sched_set_tensor_backend(sched, *join, moe_cache->backend(il));
+                cb(*join, "ffn_moe_join", il);
+            }
             return slots;
         }
     }
