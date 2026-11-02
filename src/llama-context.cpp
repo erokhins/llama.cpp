@@ -2840,7 +2840,7 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
     // only takes memory left after the layers (the reserve drops it when the compute buffers do not fit with it or leave no headroom),
     // so a fit places the same layers as without the prefetch, and a run that drops it still has the memory its copies need
     // with the MoE cache the cache takes the memory left after the layers: the measurement keeps the staging
-    if (lctx->model.hparams.no_alloc && !lctx->moe_cache) {
+    if (lctx->model.no_alloc() && !lctx->moe_cache) {
         return GGML_BACKEND_SCHED_PREFETCH_NONE;
     }
 
