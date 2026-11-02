@@ -12584,8 +12584,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16,  GGML_TYPE_F32, 10240, 4,  320, {1, 1}, {1, 1})); // hc up, 4 tokens
         // other BF16 GEMV shapes of the model and boundary probes
-        for (auto mk : std::vector<std::pair<int,int>>{{320, 10240}, {48, 2560}, {4, 10240}, {512, 2560}, {128, 2560}, {10240, 1024}, {2560, 320}, {4096, 512}, {10240, 2560}}) {
-            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk.first, 1, mk.second, {1, 1}, {1, 1}));
+        for (auto mk : std::vector<std::pair<int,int>>{{320, 10240}, {48, 2560}, {4, 10240}, {512, 2560}, {128, 2560}, {10240, 1024}, {2560, 320}, {4096, 512}, {10240, 2560}, {2560, 2560}}) {
+            for (int n : {1, 2, 5, 8}) { // 1 token, and the widths of the speculative verify batches
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+            }
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 12288, 1, 2560, {1, 1}, {1, 1})); // attn_q
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 248320, 1, 2560, {1, 1}, {1, 1})); // output

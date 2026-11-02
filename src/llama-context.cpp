@@ -1931,7 +1931,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // diagnostics: log the MoE cache hit rate every 1000 decode calls (the destructor log is lost on a forced stop)
     if (moe_cache) {
         static int n_decode_calls = 0;
-        if (++n_decode_calls % 1000 == 0) {
+        if (++n_decode_calls % 250 == 0) {
             moe_cache->log_stats();
         }
     }

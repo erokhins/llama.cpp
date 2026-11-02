@@ -177,20 +177,23 @@ struct moe_cache_fetch_args {
 };
 
 // copy the missing experts from (mapped) host memory to their slots
-static __global__ void moe_cache_fetch(const int32_t * __restrict__ info, const int n_ids, const int ne0, const moe_cache_fetch_args args, const int64_t chunk) {
+// work items are (missing expert, bank, chunk); the grid is fixed because the launch is captured in a CUDA graph, so the
+// blocks loop over the items: a lookup without misses costs one small launch instead of n_ids*n_banks*n_chunks idle blocks
+static __global__ void moe_cache_fetch(const int32_t * __restrict__ info, const int n_ids, const int ne0, const moe_cache_fetch_args args,
+        const int64_t chunk, const int n_banks, const int n_chunks) {
     const int32_t * n_fill = info + n_ids;
     const int32_t * fill_e = info + n_ids + ne0;
     const int32_t * fill_s = fill_e + n_ids;
 
-    const int j = blockIdx.x;
-    if (j >= *n_fill) {
-        return;
-    }
-    const int     b   = blockIdx.y;
+    const int n_work = (*n_fill)*n_banks*n_chunks;
+    for (int w = blockIdx.x; w < n_work; w += gridDim.x) {
+    const int     j   = w / (n_banks*n_chunks);
+    const int     r   = w - j*(n_banks*n_chunks);
+    const int     b   = r / n_chunks;
     const int64_t nb  = args.nb[b];
-    const int64_t beg = blockIdx.z*chunk;
+    const int64_t beg = (int64_t) (r - b*n_chunks)*chunk;
     if (beg >= nb) {
-        return;
+        continue;
     }
     const int64_t end = min(beg + chunk, nb);
 
@@ -221,6 +224,7 @@ static __global__ void moe_cache_fetch(const int32_t * __restrict__ info, const 
         for (int64_t i = beg + threadIdx.x; i < end; i += blockDim.x) {
             dst[i] = src[i];
         }
+    }
     }
 }
 
@@ -270,8 +274,11 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         max_nb = std::max(max_nb, (int64_t) bank->nb[2]);
     }
 
-    const int64_t chunk = 64*1024;
-    const dim3 grid(n_ids, n_banks, (unsigned) ((max_nb + chunk - 1)/chunk));
-    moe_cache_fetch<<<grid, 256, 0, stream>>>((const int32_t *) dst->data, n_ids, ne0, args, chunk);
+    const int64_t chunk    = 64*1024;
+    const int     n_chunks = (int) ((max_nb + chunk - 1)/chunk);
+    // enough blocks to keep PCIe busy for a handful of misses (each block has 16 KB of loads in flight), few enough that an
+    // empty launch stays at a few microseconds (RTX 5090: 2250 idle blocks cost 17 us per layer, 48 layers per step)
+    const int n_blocks = std::min(n_ids*n_banks*n_chunks, 512);
+    moe_cache_fetch<<<n_blocks, 256, 0, stream>>>((const int32_t *) dst->data, n_ids, ne0, args, chunk, n_banks, n_chunks);
     CUDA_CHECK(cudaGetLastError());
 }

@@ -788,6 +788,15 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// GGML_CUDA_NO_MMVF_SMALL_ROWS=1 restores the MMF path for few-row BF16/F16 matrices at 2..8 columns (A/B testing)
+static bool ggml_cuda_mmvf_small_rows_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_NO_MMVF_SMALL_ROWS");
+        return env == nullptr || atoi(env) == 0;
+    }();
+    return enabled;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -829,6 +838,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                         ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
                     return false;
                 }
+                // few long rows at small batch: MMF runs ne01/32 blocks, too few to saturate the memory bus
+                // (RTX 5090, 320x10240 BF16 at 5 columns: MMF 15.9 us vs MMVF 9.7 us; 2560 rows and up MMF wins again)
+                if (ne11 <= MMVF_MAX_BATCH_SIZE && src0_ne[1] <= 512 && src0_ne[0] >= 2048 && src0_ne[2]*src0_ne[3] == 1 && ggml_cuda_mmvf_small_rows_enabled()) {
+                    return true;
+                }
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
                 if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
@@ -866,6 +880,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (ne11 == 1 && src0_ne[0] <= 1024 && src0_ne[1] >= 2048 && src0_ne[2]*src0_ne[3] == 1 &&
                         ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
                     return false;
+                }
+                // few long rows at small batch: MMF runs ne01/32 blocks, too few to saturate the memory bus
+                // (RTX 5090, 320x10240 BF16 at 5 columns: MMF 15.9 us vs MMVF 9.7 us; 2560 rows and up MMF wins again)
+                if (ne11 <= MMVF_MAX_BATCH_SIZE && src0_ne[1] <= 512 && src0_ne[0] >= 2048 && src0_ne[2]*src0_ne[3] == 1 && ggml_cuda_mmvf_small_rows_enabled()) {
+                    return true;
                 }
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size

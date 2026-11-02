@@ -243,6 +243,29 @@ static const char * ggml_cuda_op_timing_stage(const ggml_tensor * node) {
     if (it == other_keys.end()) it = other_keys.emplace(k, k).first;
     return it->second.c_str();
 }
+// GGML_CUDA_OP_TIMING_LAYER=N: in per-op mode, time only the nodes of layer N (name or a source name ending in "-N"),
+// so the event overhead stays out of the other layers; a few empty event pairs are added for calibration
+static int ggml_cuda_op_timing_layer() {
+    static const int layer = getenv("GGML_CUDA_OP_TIMING_LAYER") ? atoi(getenv("GGML_CUDA_OP_TIMING_LAYER")) : -1;
+    return layer;
+}
+static bool ggml_cuda_op_timing_in_layer(const ggml_tensor * node) {
+    const int layer = ggml_cuda_op_timing_layer();
+    if (layer < 0) return true;
+    char suffix[16];
+    snprintf(suffix, sizeof(suffix), "-%d", layer);
+    const size_t ls = strlen(suffix);
+    auto ends = [&](const char * name) {
+        const size_t n = name ? strlen(name) : 0;
+        return n >= ls && strcmp(name + n - ls, suffix) == 0;
+    };
+    if (ends(node->name)) return true;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (node->src[i] && ends(node->src[i]->name)) return true;
+    }
+    return false;
+}
+static int ggml_cuda_op_timing_calib_left = 0;
 static const char * ggml_cuda_op_timing_cur_stage = nullptr;
 static void ggml_cuda_op_timing_begin(cudaStream_t s, const void * key) {
     auto & r = ggml_cuda_op_timing(key);
@@ -4864,6 +4887,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (ggml_cuda_op_timing_enabled()) {
                 ggml_cuda_op_timing(use_cuda_graph ? graph_key : nullptr).n = 0;
                 ggml_cuda_op_timing_cur_stage = nullptr;
+                ggml_cuda_op_timing_calib_left = ggml_cuda_op_timing_layer() >= 0 ? 16 : 0;
             }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -4926,8 +4950,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_cuda_op_timing_begin(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr);
                             ggml_cuda_op_timing_cur_stage = st;
                         }
-                    } else {
+                    } else if (ggml_cuda_op_timing_in_layer(node)) {
+                        if (ggml_cuda_op_timing_calib_left > 0) {
+                            // an empty pair: measures the cost of the event pair itself
+                            ggml_cuda_op_timing_begin(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr);
+                            ggml_cuda_op_timing_end(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr, "calibration (empty pair)");
+                            ggml_cuda_op_timing_calib_left--;
+                        }
                         ggml_cuda_op_timing_begin(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr);
+                        ggml_cuda_op_timing_cur_stage = "op"; // marks that this node is timed
+                    } else {
+                        ggml_cuda_op_timing_cur_stage = nullptr;
                     }
                 }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
@@ -4938,7 +4971,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_cuda_kernel_stats_hist()[key]++;
                         ggml_cuda_kernel_stats_dispatched++;
                     }
-                    if (ggml_cuda_op_timing_enabled() && !ggml_cuda_op_timing_by_stage()) {
+                    if (ggml_cuda_op_timing_enabled() && !ggml_cuda_op_timing_by_stage() && ggml_cuda_op_timing_cur_stage != nullptr) {
                         ggml_cuda_op_timing_end(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr, std::string("FUSED(") + std::to_string(nodes_to_skip + 1) + ") " + ggml_op_desc(node) + " .. " + ggml_op_desc(cgraph->nodes[i + nodes_to_skip]));
                     }
 #ifdef GGML_CUDA_DEBUG
@@ -4972,8 +5005,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_cuda_kernel_stats_dispatched++;
                 }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
-                if (ggml_cuda_op_timing_enabled() && !ggml_cuda_op_timing_by_stage()) {
-                    ggml_cuda_op_timing_end(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr, ggml_op_desc(node));
+                if (ggml_cuda_op_timing_enabled() && !ggml_cuda_op_timing_by_stage() && ggml_cuda_op_timing_cur_stage != nullptr) {
+                    ggml_cuda_op_timing_end(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr, std::string(ggml_op_desc(node)) + " " + (node->name[0] ? node->name : ""));
                 }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
