@@ -824,6 +824,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
             return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                // short rows and many of them: one block per row is launch bound, MMF is about 3x faster (RTX 5090: 10240x320 BF16 10.3 us -> 3.2 us)
+                if (ne11 == 1 && src0_ne[0] <= 1024 && src0_ne[1] >= 2048 && src0_ne[2]*src0_ne[3] == 1 &&
+                        ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
+                    return false;
+                }
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
                 if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
@@ -857,6 +862,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
             return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                // short rows and many of them: one block per row is launch bound, MMF is about 3x faster (RTX 5090: 10240x320 BF16 10.3 us -> 3.2 us)
+                if (ne11 == 1 && src0_ne[0] <= 1024 && src0_ne[1] >= 2048 && src0_ne[2]*src0_ne[3] == 1 &&
+                        ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
+                    return false;
+                }
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
                 if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {

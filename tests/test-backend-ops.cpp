@@ -12564,6 +12564,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Qwen3.8-Flash-Next IQ3_S decode shapes (TEST_QWEN4EXP_SHAPES=1): routed experts 512x10, n_embd 2560, n_ff 640
+    if (getenv("TEST_QWEN4EXP_SHAPES")) {
+        for (int n : {1, 4}) {
+            for (ggml_type t : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, false, 640, n, 2560)); // gate/up
+            }
+            for (ggml_type t : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, false, 2560, n, 640)); // down
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1})); // attn_qkv
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32,  2560, 1, 6144, {1, 1}, {1, 1})); // ssm_out
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16,  GGML_TYPE_F32, 10240, 1,  320, {1, 1}, {1, 1})); // hc up
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16,  GGML_TYPE_F32,   320, 1, 10240, {1, 1}, {1, 1})); // hc down
+        for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) { // alternatives for the hc weights
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 10240, 1,  320, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,   320, 1, 10240, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16,  GGML_TYPE_F32, 10240, 4,  320, {1, 1}, {1, 1})); // hc up, 4 tokens
+        // other BF16 GEMV shapes of the model and boundary probes
+        for (auto mk : std::vector<std::pair<int,int>>{{320, 10240}, {48, 2560}, {4, 10240}, {512, 2560}, {128, 2560}, {10240, 1024}, {2560, 320}, {4096, 512}, {10240, 2560}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk.first, 1, mk.second, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 12288, 1, 2560, {1, 1}, {1, 1})); // attn_q
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 248320, 1, 2560, {1, 1}, {1, 1})); // output
+        return test_cases;
+    }
+
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 
