@@ -204,6 +204,46 @@ static unsigned int ggml_cuda_op_timing_flags(cudaStream_t s) {
     cudaStreamIsCapturing(s, &st);
     return st != cudaStreamCaptureStatusNone ? cudaEventRecordExternal : cudaEventRecordDefault;
 }
+// GGML_CUDA_OP_TIMING=2: time per layer stage instead of per op (fewer event nodes, less distortion)
+static bool ggml_cuda_op_timing_by_stage() {
+    static const bool by_stage = [] { const char * e = getenv("GGML_CUDA_OP_TIMING"); return e && atoi(e) >= 2; }();
+    return by_stage;
+}
+static const char * ggml_cuda_op_timing_stage(const ggml_tensor * node) {
+    auto has = [](const char * name, const char * sub) { return name && strstr(name, sub) != nullptr; };
+    const char * names[GGML_MAX_SRC + 1];
+    int n = 0;
+    names[n++] = node->name;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (node->src[i]) names[n++] = node->src[i]->name;
+    }
+    if (node->op == GGML_OP_MOE_CACHE_LOOKUP) return "router+lookup";
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        return has(node->name, "ffn_moe_down") ? "experts down" : "experts gate/up";
+    }
+    if (node->op == GGML_OP_DSV4_HC_PRE) return "hc pre";
+    if (node->op == GGML_OP_DSV4_HC_POST) return "hc post";
+    for (int i = 0; i < n; ++i) {
+        const char * nm = names[i];
+        if (has(nm, "ffn_moe_swiglu") || has(nm, "ffn_moe_gate") || has(nm, "ffn_moe_up")) return "experts gate/up";
+        if (has(nm, "ffn_moe_weighted") || has(nm, "ffn_moe_out") || has(nm, "ffn_moe_down")) return "experts sum";
+        if (has(nm, "ffn_moe_") || has(nm, "ffn_gate_inp") || has(nm, "moe_cache")) return "router+lookup";
+        if (has(nm, "shexp") || has(nm, "ffn_gate-") || has(nm, "ffn_up-") || has(nm, "ffn_swiglu") || has(nm, "ffn_out") || has(nm, "shared_expert")) return "shared expert";
+        if (has(nm, "hc_inject") || has(nm, "hc_combine") || has(nm, "l_last")) return "hc post";
+        if (has(nm, "hc_") || has(nm, "hc_norm")) return "hc pre";
+        if (has(nm, "indexer") || has(nm, "cache_idx")) return "attn indexer";
+        if (has(nm, "attn_") || has(nm, "Qcur") || has(nm, "Kcur") || has(nm, "Vcur") || has(nm, "kqv") || has(nm, "kq_mask") || has(nm, "cache_k") || has(nm, "cache_v")) return "attention";
+        if (has(nm, "ssm") || has(nm, "conv") || has(nm, "cache_r") || has(nm, "cache_s") || has(nm, "rs_s_copy") || has(nm, "alpha") || has(nm, "beta") || has(nm, "a_softplus") || has(nm, "gate-") || has(nm, "z-") || has(nm, "linear_attn") || has(nm, "new_state") || has(nm, "final_output") || has(nm, "norm-")) return "ssm";
+        if (has(nm, "token_embd") || has(nm, "inp_") || has(nm, "per_layer") || has(nm, "ple") || has(nm, "output") || has(nm, "result")) return "embed/output";
+    }
+    // unclassified: keep the op name so the table shows what it is
+    static std::map<std::string, std::string> other_keys;
+    std::string k = std::string("other: ") + ggml_op_desc(node) + " " + (node->name[0] ? node->name : "") + " <- " + (node->src[0] && node->src[0]->name[0] ? node->src[0]->name : "");
+    auto it = other_keys.find(k);
+    if (it == other_keys.end()) it = other_keys.emplace(k, k).first;
+    return it->second.c_str();
+}
+static const char * ggml_cuda_op_timing_cur_stage = nullptr;
 static void ggml_cuda_op_timing_begin(cudaStream_t s, const void * key) {
     auto & r = ggml_cuda_op_timing(key);
     if ((int) r.evs.size() < 2*(r.n + 1)) {
@@ -4823,6 +4863,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             if (ggml_cuda_op_timing_enabled()) {
                 ggml_cuda_op_timing(use_cuda_graph ? graph_key : nullptr).n = 0;
+                ggml_cuda_op_timing_cur_stage = nullptr;
             }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -4876,7 +4917,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if (ggml_cuda_op_timing_enabled()) {
-                    ggml_cuda_op_timing_begin(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr);
+                    if (ggml_cuda_op_timing_by_stage()) {
+                        const char * st = ggml_cuda_op_timing_stage(node);
+                        if (st != ggml_cuda_op_timing_cur_stage) {
+                            if (ggml_cuda_op_timing_cur_stage) {
+                                ggml_cuda_op_timing_end(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr, ggml_cuda_op_timing_cur_stage);
+                            }
+                            ggml_cuda_op_timing_begin(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr);
+                            ggml_cuda_op_timing_cur_stage = st;
+                        }
+                    } else {
+                        ggml_cuda_op_timing_begin(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr);
+                    }
                 }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
@@ -4886,7 +4938,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_cuda_kernel_stats_hist()[key]++;
                         ggml_cuda_kernel_stats_dispatched++;
                     }
-                    if (ggml_cuda_op_timing_enabled()) {
+                    if (ggml_cuda_op_timing_enabled() && !ggml_cuda_op_timing_by_stage()) {
                         ggml_cuda_op_timing_end(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr, std::string("FUSED(") + std::to_string(nodes_to_skip + 1) + ") " + ggml_op_desc(node) + " .. " + ggml_op_desc(cgraph->nodes[i + nodes_to_skip]));
                     }
 #ifdef GGML_CUDA_DEBUG
@@ -4920,7 +4972,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_cuda_kernel_stats_dispatched++;
                 }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
-                if (ggml_cuda_op_timing_enabled()) {
+                if (ggml_cuda_op_timing_enabled() && !ggml_cuda_op_timing_by_stage()) {
                     ggml_cuda_op_timing_end(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr, ggml_op_desc(node));
                 }
                 if (!ok) {
@@ -4931,6 +4983,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            if (ggml_cuda_op_timing_enabled() && ggml_cuda_op_timing_by_stage() && ggml_cuda_op_timing_cur_stage) {
+                ggml_cuda_op_timing_end(cuda_ctx->stream(), use_cuda_graph ? graph_key : nullptr, ggml_cuda_op_timing_cur_stage);
+                ggml_cuda_op_timing_cur_stage = nullptr;
             }
             if (ggml_cuda_kernel_stats_enabled() && cgraph->n_nodes > 1000) {
                 auto & hist = ggml_cuda_kernel_stats_hist();
