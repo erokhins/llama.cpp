@@ -14,6 +14,13 @@ Session date: 2026-11-02. Everything lives under `C:\Users\erokh\testing\` unles
 - **State at end of session: nothing is serving on :8080.** See "How to start things" below.
 - **Evening update:** Unsloth PR #268 merged onto b11960 and built locally closes much of the gap: decode 92,
   prompt 3,350 tok/s at 30k, 142 tok/s with 4 requests (12 GB cache, no MTP). Details in the "Update" section below.
+- **2026-11-04 status (commit 96f2bd1d4):** best llama.cpp stack = `--spec-draft-n-max 3 --backend-sampling
+  --spec-draft-backend-sampling --moe-cache-mib 24000` + `LLAMA_MTP_VOCAB=98304 LLAMA_GRAPH_WIDTH_CACHE=1
+  GGML_CUDA_GRAPH_WARMUP=0 LLAMA_KV_PAD=2048` (+ `LLAMA_MOE_CACHE_TAIL_SKIP=7` for Strata's accuracy trade).
+  Exact: **166 tok/s** on the 89-token prompt (Strata with its miss tricks off: 181, -8%), **155 / 165 / 167** on the three
+  1024-token chat prompts. With the tail skip: **175** (Strata default 204, -14%) and **189 / 171 / 193** (Strata serve 199 /
+  203 / 169, -4% on average). Started the day at 136 / 139-159. Remaining structural gap: Strata's draft-probability gate
+  (needs cheap narrow rounds, i.e. the fused device-side draft) and its CPU-pool miss overlap.
 - **2026-11-03 update:** with the 20 GB expert-cache layout (`-c 32768 -np 2 -b 2048 -ub 2048 --moe-cache-mib 24576`)
   and three CUDA fixes found by Nsight Systems (commit 7ad8dae47), llama.cpp reaches **134-139 tok/s with MTP-4**
   (`--spec-draft-n-ubatch 64`) and 107-110 without MTP; Strata 183-211. The remaining gap is attributed in the
