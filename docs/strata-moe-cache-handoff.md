@@ -766,6 +766,25 @@ Not ported (judged not worth it now): the in-place expert read (~3-4% at best he
 slots being read; it needs the deferred seed first, which is now in), the MMQ scratch sharing (one of three `mm_ids_helper`
 and one quantize per layer, ~1.5%, needs the scheduler to pair the nodes), the cache lending (the big one, see 3. above).
 
+### Ubatch size vs prompt length (same build, no MTP, `-c 32768 -np 1`, 12 GB cache, depth 3)
+
+Server-side tok/s, each prompt size twice (the first prompt after load is cold: no seeded cache yet):
+
+| `-ub` | compute buffer | 15k prompt | 30k prompt |
+|---|---|---|---|
+| 8192 | 4,214 MiB | 4,322 / 4,725 | 4,456 / 4,571 |
+| 16384 | ~8.4 GB | 4,111 / 4,524 | 4,254 / 4,420 |
+
+Conclusions: (1) at `-ub 8192` the prompt length no longer matters (15k and 30k run at the same rate), so the per-ubatch
+weight traffic is hidden and the run is compute-bound; (2) doubling the ubatch to 16384 is 3-5% *slower*, so the target
+for the generation-first layout is `-ub 8192` (4.2 GB of compute buffer plus staging to lend from the cache during prompts,
+not the 17 GB a 32k ubatch would need); (3) the compute ceiling of today's kernels is ~4,500 tok/s (was 4,000-4,100 before
+the depth-3 and deferred-seeding changes), against Strata's ~7,200 for the same prompt: streaming each expert once explains
+the step from the 2,500 of `-ub 2048`, the remaining 1.6x is kernel efficiency (launch gaps, 40-60% empty MMQ tiles,
+no gate/up/SwiGLU fusion for MoE, f32->bf16 converts, `mm_ids_helper` per matmul). Files: `builds-bench/pp-ub8k-*`,
+`pp-ub16k-*`. Note `--phase-aware-workspace` (commit 3d8925f7c) already releases the compute buffers between prompts;
+what is missing is the cache growing into the freed VRAM (fixed `cudaMalloc`, sized at startup for the full reservation).
+
 ## Machine
 
 - RTX 5090 32 GB (driver 610.88, CUDA UMD 13.3).
