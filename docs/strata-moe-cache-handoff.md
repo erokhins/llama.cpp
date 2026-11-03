@@ -832,6 +832,63 @@ ubatch boundary), ~25 expert plumbing (three id sorts and three activation quant
 the cache D2D copies that in-place reads would remove, unfused gates/reduction), ~21 expert GEMM kernels, ~28 fusion of
 the elementwise/HC/norm soup, ~11 dense-vs-sparse attention; llama.cpp is ahead by ~14 on GDN and dense matmuls.
 
+## Update, 2026-11-03: the expert GEMM gap (why, what was tried, Unsloth PR 264 ported)
+
+**Why Strata's expert GEMMs are faster.** Strata does not run MMQ for prompt experts on NVIDIA cards with 80+ SMs: its
+`STRATA_PF_FUSED` path (`src/prefill/moe_fused_iq.cu`, MIT, 2,175 lines) is a dedicated kernel: IQ blocks decoded to int8
+in shared memory one stage ahead, activations by cp.async four stages deep, ldmatrix fragments, `mma.sync m16n8k32`
+int8 with the int32->float "magic add", gate and up fused as one 1,280-row GEMM, SwiGLU and the int8 re-quantization of H
+in the epilogue, per-expert row tiles of 256x64 or 128x128 chosen by the rows per expert. Its own measurements: 1.30-1.92x
+over its MMQ path per layer. The kernel hard-codes this model's shapes (K 2560 / 640, 1,280 / 2,560 rows) and its own
+80-byte activation block, so a port into ggml is a multi-day job, not a knob.
+
+**What MMQ's limit is (test-backend-ops perf, `TEST_QWEN4EXP_PP=N`, new cases: the model's expert matmuls at N tokens).**
+At 8192 tokens, before any change: gate/up IQ2_S 4.69 ms, IQ3_XXS 4.65, IQ3_S 4.33, **Q8_0 4.84, Q4_0 4.62**; down IQ4_NL
+6.10, Q2_0 6.19, **Q8_0 6.42, Q4_0 6.10**. Q8_0/Q4_0 are no faster than the IQ types, so the in-kernel dequantization is
+not the bottleneck and "dequantize to Q8 first" cannot win. MMQ has no cp.async/double buffering: each block's K loop is
+load tiles -> sync -> mma -> sync with synchronous global loads, one 8-warp 128x128 block per SM (Ampere table, used on
+Blackwell for all non-FP4 types). Tried: 4-warp 64-row tiles, two blocks per SM (the RDNA3 layout) - gate/up 12-20%
+slower, down -2..-8%, dropped.
+
+**Unsloth PR #264 "CUDA: faster MoE prompt processing" ported** (open PR, pinned in Unsloth's nightly sets; its diff over
+upstream is 819 lines in 8 CUDA files + tests; one conflict with our old `GGML_CUDA_MMQ_ID_NCOLS` experiment, which it
+supersedes; `GGML_CUDA_CC_IS_RDNA4_M` dropped, our base lacks it). Pieces: (1) compact MMQ column tiles - expert e owns
+`expert_bounds[e]/J + e` consecutive virtual tiles instead of `ceil(ne12/J)` mostly-empty ones, and J is chosen for the
+average expert's rows; (2) a GPU counting sort for the expert permutation instead of the single-warp `mm_ids_helper`
+(`GGML_CUDA_MM_IDS_SORT=0/1` forces); (3) GET_ROWS: one thread per element for rows under 64 elements, vectorised
+converting path; (4) device permutation in the cuBLAS mul_mat_id fallback. Correctness here: MUL_MAT_ID 984/984, GET_ROWS
+340/340.
+
+| expert matmul op, 8192 tokens | before | PR 264 | sort off |
+|---|---|---|---|
+| IQ3_S gate/up | 4.33 ms | 3.55 | 4.04 |
+| IQ2_S gate/up | 4.69 | 3.84 | 4.08 |
+| IQ3_XXS gate/up | 4.65 | 3.73 | |
+| IQ4_NL down | 6.10 | 3.63 | 6.33 |
+| Q2_0 down | 6.19 | 5.63 | |
+
+In situ (server tok/s at 30k, same prompts as the step table above):
+
+| config | before | PR 264, sort on | PR 264, sort off |
+|---|---|---|---|
+| `-ub 8192`, 12 GB cache, no MTP | 4,456 / 4,571 | 4,897 / 5,090 | 4,847 / 5,084 |
+| c128k (`-ub 4096`, 12 GB) | 3,753 / 3,826 | 3,935 / 4,048 | 4,068 / 4,174 |
+| bestgen (`-ub 2048`, 24 GB, MTP-3) | 2,489 / 2,529 | 2,414 / 2,436 | 2,537 / 2,568 |
+
+The compact tiling is the gain; the counting sort (4 launches per matmul instead of 1) is neutral at 8192 and a loss at
+2048/4096 on this fork because the host thread is already busy issuing the expert prefetch copies, although in the harness
+it is never slower. So `mm_ids_counting_sort_faster` reads `GGML_CUDA_MM_IDS_SORT_MIN` (default 8192 here, upstream 512).
+Final pass with the defaults (sort threshold 8192, same build as committed): bestgen 30k **2,567 / 2,602** tok/s (+3%
+over 2,489-2,529), c128k **4,078 / 4,183** (+9% over 3,753-3,826), `-ub 8192` 4,897 / 5,090 (+10%). Expert GEMMs are now
+~1.3x behind Strata's fused kernel instead of 1.6x; the rest of that is the kernel structure described above.
+
+Decode check (`llama_bench_tf.sh`, MTP-3, 600 tokens): the PR build read 141.3 / 143.3 tok/s against the 146.9 / 147.2
+measured on the pre-PR build earlier in the day, and neither the sort (141.1 / 141.3 off) nor GET_ROWS (141.0 / 142.5
+without it) explained it. A same-session A/B settled it: a fresh build of the pre-PR commit (`src/llama-ab`, worktree at
+a0506b400, `BIN=... llama_bench_tf.sh`) interleaved with the PR build gave **142.5 (pre-PR) vs 143.2 / 143.3 (PR)**, so
+the port is decode-neutral and the morning's 147 was machine state, not code. Lesson: decode A/Bs need both binaries in
+the same session (`BIN=` override in `llama_bench_tf.sh`).
+
 ## Machine
 
 - RTX 5090 32 GB (driver 610.88, CUDA UMD 13.3).
