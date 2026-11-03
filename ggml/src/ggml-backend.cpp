@@ -1548,6 +1548,25 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                            // GGML_SCHED_WEIGHTS_PER_SPLIT=N (default 1, upstream behaviour): up to N host weights share a split.
+                            // With 2 the gate and up expert tensors of a MoE layer land in one split, so the backend can fuse
+                            // gate/up/GLU into one MMQ launch and the split count (event waits, copy issue) halves; the
+                            // staging slot of a split then holds both copies.
+                            static const int weights_per_split = [] {
+                                const char * env = getenv("GGML_SCHED_WEIGHTS_PER_SPLIT");
+                                return env ? std::max(1, atoi(env)) : 1;
+                            }();
+                            int n_host_weights = 0;
+                            if (weights_per_split > 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                                for (int k = 0; k < split->n_inputs; k++) {
+                                    const struct ggml_tensor * in = split->inputs[k];
+                                    n_host_weights += in->buffer != NULL && in->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                                                      ggml_backend_buffer_is_host(in->buffer);
+                                }
+                                if (n_host_weights < weights_per_split) {
+                                    continue; // join the current split
+                                }
+                            }
                             need_new_split = true;
                             break;
                         }

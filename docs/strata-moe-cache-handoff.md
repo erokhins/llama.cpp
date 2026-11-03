@@ -889,6 +889,35 @@ a0506b400, `BIN=... llama_bench_tf.sh`) interleaved with the PR build gave **142
 the port is decode-neutral and the morning's 147 was machine state, not code. Lesson: decode A/Bs need both binaries in
 the same session (`BIN=` override in `llama_bench_tf.sh`).
 
+## Update, 2026-11-03: existing PRs for the remaining items (what was taken, what was not)
+
+Searched the Unsloth fork (346 PRs) and upstream for the open items of the prefill stage table.
+
+- **Taken, cherry-picked cleanly from upstream (2 commits above our base b11960):** `f5222f25c` "cuda: fuse MoE (MUL_MAT_ID)
+  gate/up and GLU in MMQ" (ggml-org #31188, +5.7-6.1% pp on an RTX 5090 for Qwen3-30B/3.6-35B upstream), `8fc037672` Q8_1
+  correction-sum fix (#31247), `00f113ece` no premature eviction of CUDA graphs about to be used (#30662). MUL_MAT_ID 984/984.
+  **The fusion does not fire in our prompt graphs yet.** The CUDA backend fuses only when gate, up and GLU are consecutive
+  nodes of the same split, and the scheduler opens a new split for every host weight (upstream rule at `need_new_split`),
+  so gate and up are always in different splits. New knob `GGML_SCHED_WEIGHTS_PER_SPLIT=N` (default 1 = upstream): with 2
+  the gate and up tensors share a split (61 splits instead of 134, slot = both copies, 794 MiB). Measured, 30k prompts:
+  `-ub 8192` 12 GB cache **4,955 / 5,158 -> 5,230 / 5,383 (+4%)**; c128k 4,075 / 4,167 -> 3,980 / 4,115 (neutral/-2%);
+  bestgen (`-ub 2048`, MTP) **2,576 / 2,602 -> 2,142 / 2,222 (-15%)**, also -15% at depth 2 with the cache back at 18.7 GB,
+  so it is the coarser pipeline (a split waits for two uploads before computing), not the memory. The nsys trace of the
+  paired `-ub 8192` run still shows no fused `mul_mat_q<..., true>` launches and the same `mm_ids_helper`/quantize counts,
+  so the +4% there is the halved split count, and the fusion is blocked by something else in our graph (candidates:
+  `ggml_cuda_mmq_fusion_is_efficient` with the nominal tiles of 512 experts, the staging-copy weights' buffer checks, or
+  a node between up and gate); not yet debugged. Pairing stays opt-in for `-ub 8192` prompt-first servers.
+- **Taken earlier today:** Unsloth #264 (compact MMQ tiling, counting sort, GET_ROWS), see the section above.
+- **Not applicable / not taken:** Unsloth #321 "`--fit` grows the ubatch of MoE models into spare VRAM" (2.3-2.5x pp where
+  VRAM is spare; the 24 GB generation layout has none, and it does not lend cache memory). Unsloth #345 "MoE cache seeds a
+  long first prompt chunk from the last prompt's routing" (+1% at ub 2048, +7% at ub 8192 on Blackwell; our deferred seeding
+  and `moe_cache_seed_prev` cover most of it; it also notes a decode loss from a non-PDL kernel on the copy queue). Upstream
+  am17an #29887 "GPU cache for MoE experts kept in host memory" is upstream's own LRU expert cache for <= 32-token batches,
+  no lending, no prompt path. Unsloth #295 (deepseek41 sparse attention: flash attention over window + top-k rows,
+  `n_kv_max = window + top_k`) is the pattern our qwen4exp prompt attention would need (dense FA with a mask today), but it
+  is written for DeepSeek 4.1. No PR exists for: cache lending to the prompt phase, CUDA-graph capture of prompt graphs,
+  the hyper-connection f32->bf16 converts, a fused device-side MTP draft.
+
 ## Machine
 
 - RTX 5090 32 GB (driver 610.88, CUDA UMD 13.3).
