@@ -558,6 +558,15 @@ padding was not their main trigger (pad 2048 only cut the large-graph rebuilds 9
 most of the draft context's property changes come from elsewhere (to be found: likely n_outputs / recurrent-state inputs of
 the update ubatches). Both switches are opt-in with upstream defaults.
 
+**Device-resident inputs: tried, negative (`LLAMA_GRAPH_INPUTS_ON_DEVICE`, kept opt-in).** Pinning the tensor_set inputs of
+the width-slot graphs to the GPU turns the scheduler's batched upload into one `cudaMemcpy` per input (~10 us each on WDDM,
+"inputs" 4 -> 45 us per decode), while the recurrent/KV index inputs (`rs_s_copy`, the unnamed KV idx leafs) are written as
+host memory by the cache code and still go through the upload path (sync + async copy + sync), so nothing is saved:
+162.4 -> 157.9 tok/s. Lesson: on WDDM the draft step's host floor is the number of CUDA API calls per step (currently
+~5: upload pre-sync, upload, post-sync, graph launch, result sync, ~20-70 us each). The only way below it is to produce
+the draft's inputs on the device and read the result once per round, i.e. Strata's captured round: one graph launch per
+draft step with device-to-device copies and a single sync at the end. That is the fused-draft design (3-5 days).
+
 Proposals, in order of value per effort:
 1. (done, see above) Capture CUDA graphs after one stable execution instead of two, or immediately for graphs the width cache owns
    (`warmup_complete` logic in `ggml-cuda.cu`): saves ~45 ms per main-graph change; env-tunable.
