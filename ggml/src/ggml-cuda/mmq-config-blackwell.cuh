@@ -33,5 +33,14 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
 
+    // Qwen3.8-Flash-Next expert down projections (K = 640, 2560 rows) at J = 128: 4-warp blocks with 64-row tiles, two per
+    // SM (the RDNA3 layout) instead of the Ampere table's one 8-warp 128-row block. Measured in test-backend-ops perf
+    // (TEST_QWEN4EXP_PP=8192) on an RTX 5090: IQ4_NL 6.10 -> 5.99 ms, Q2_0 6.19 -> 5.68 ms; the same layout made the
+    // gate/up types (IQ2_S, IQ3_XXS, IQ3_S; K = 2560, 640 rows) 12-20% slower, so those keep the Ampere table.
+    CASE(GGML_TYPE_IQ4_NL,  128, 2,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_IQ4_NL,  128, 2,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+    CASE(GGML_TYPE_Q2_0,    128, 2,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q2_0,    128, 2,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 }

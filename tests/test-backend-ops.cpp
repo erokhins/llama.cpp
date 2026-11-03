@@ -12564,6 +12564,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Qwen3.8-Flash-Next prompt shapes (TEST_QWEN4EXP_PP=N tokens, default 8192): the routed expert matmuls of a ubatch,
+    // in the model's types and in Q8_0/Q4_0 as dequantization-cost probes
+    if (getenv("TEST_QWEN4EXP_PP")) {
+        const int n = std::max(1, atoi(getenv("TEST_QWEN4EXP_PP")));
+        for (ggml_type t : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, false, 640, n, 2560)); // gate/up
+        }
+        for (ggml_type t : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, false, 2560, n, 640)); // down
+        }
+        return test_cases;
+    }
+
     // Qwen3.8-Flash-Next IQ3_S decode shapes (TEST_QWEN4EXP_SHAPES=1): routed experts 512x10, n_embd 2560, n_ff 640
     if (getenv("TEST_QWEN4EXP_SHAPES")) {
         for (int n : {1, 4}) {
