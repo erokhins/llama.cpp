@@ -66,6 +66,10 @@ public:
     // staged[e]: expert e was copied to dst for this ubatch (only those can fill a slot)
     void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts, const std::vector<bool> & staged);
 
+    // seed the layer of w from host memory with the routing counts of an earlier ubatch (no staged copy exists), every expert
+    // tensor of the layer; between graphs, followed by seed_end
+    void seed_from_host(const ggml_tensor * w, const std::vector<int32_t> & counts);
+
     // after the graph is computed: drop the admissions of layers that were not seeded for all of their expert tensors
     void seed_end();
 

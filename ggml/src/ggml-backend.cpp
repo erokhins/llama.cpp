@@ -2041,7 +2041,8 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
             pf->start = ggml_backend_event_new(backend->device);
             ok = pf->start != NULL;
         }
-        for (int s = 0; ok && s < sched->pf_depth; s++) {
+        // events for every depth the scheduler may be set to (ggml_backend_sched_set_prefetch_depth)
+        for (int s = 0; ok && s < GGML_SCHED_MAX_PREFETCH_DEPTH; s++) {
             pf->ready[s]  = ggml_backend_event_new(backend->device);
             pf->retire[s] = ggml_backend_event_new(backend->device);
             ok = pf->ready[s] != NULL && pf->retire[s] != NULL;
@@ -3004,6 +3005,17 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
 void ggml_backend_sched_set_prefetch_headroom(ggml_backend_sched_t sched, size_t headroom) {
     GGML_ASSERT(sched);
     sched->pf_headroom = headroom;
+}
+
+void ggml_backend_sched_set_prefetch_depth(ggml_backend_sched_t sched, int depth) {
+    GGML_ASSERT(sched);
+    depth = std::min(std::max(depth, 1), GGML_SCHED_MAX_PREFETCH_DEPTH);
+    if (depth == sched->pf_depth) {
+        return;
+    }
+    // the slots of the previous graph are laid out for its depth: no copy or reader of the arena may be in flight
+    ggml_backend_sched_prefetch_sync(sched);
+    sched->pf_depth = depth;
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {

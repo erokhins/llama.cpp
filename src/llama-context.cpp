@@ -393,12 +393,23 @@ llama_context::llama_context(
         // LLAMA_MOE_CACHE_SEED=0 disables the seed of the MoE cache at the end of a prompt
         const char * LLAMA_MOE_CACHE_SEED = getenv("LLAMA_MOE_CACHE_SEED");
         moe_cache_seed_enabled = LLAMA_MOE_CACHE_SEED == nullptr || atoi(LLAMA_MOE_CACHE_SEED) != 0;
+        // LLAMA_MOE_CACHE_SEED_DEFER=0: every batch seeds (the first one reads its ids before its copies), as before
+        const char * LLAMA_MOE_CACHE_SEED_DEFER = getenv("LLAMA_MOE_CACHE_SEED_DEFER");
+        moe_cache_seed_defer = LLAMA_MOE_CACHE_SEED_DEFER == nullptr || atoi(LLAMA_MOE_CACHE_SEED_DEFER) != 0;
 
         if (GGML_SCHED_PREFETCH && atoi(GGML_SCHED_PREFETCH) == 0) {
             prefetch_min_batch = INT64_MAX;
         } else if (GGML_SCHED_PREFETCH_MIN_BATCH) {
             prefetch_min_batch = std::max(1, atoi(GGML_SCHED_PREFETCH_MIN_BATCH));
         }
+        // the prefetched (prompt) graphs get a deeper staging pipeline than the small ones: 2 slots leave the copy engine and
+        // the SMs each ~65% busy (one split ahead, jitter stalls both). 30k prompt at -ub 2048 / 4096: 3 slots +11% / +13%,
+        // 4 slots +14% / +20%; each slot is one expert tensor of staging (450 MiB here) that the memory fit takes from the
+        // expert cache, so generation loses ~1% per slot: 3 by default
+        const char * GGML_SCHED_PREFETCH_DEPTH       = getenv("GGML_SCHED_PREFETCH_DEPTH");
+        const char * GGML_SCHED_PREFETCH_DEPTH_LARGE = getenv("GGML_SCHED_PREFETCH_DEPTH_LARGE");
+        prefetch_depth_small = GGML_SCHED_PREFETCH_DEPTH       ? std::max(1, atoi(GGML_SCHED_PREFETCH_DEPTH))       : 2;
+        prefetch_depth_large = GGML_SCHED_PREFETCH_DEPTH_LARGE ? std::max(1, atoi(GGML_SCHED_PREFETCH_DEPTH_LARGE)) : std::max(3, prefetch_depth_small);
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -1671,6 +1682,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         prefetch_n_tokens = ubatch.n_tokens;
+        ggml_backend_sched_set_prefetch_depth(sched_cur, prefetch_n_tokens >= prefetch_min_batch ? prefetch_depth_large : prefetch_depth_small);
         // LLAMA_GRAPH_INPUTS_ON_DEVICE=1|2: the input tensors of a width-slot graph live on the first (GPU) backend and are set with
         // direct copies, instead of host buffers the scheduler uploads with a sync before and after (~125 us per step on Windows);
         // 2 applies it only to small (draft) models whose weights are all on the device
@@ -1985,7 +1997,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // diagnostics: log the MoE cache hit rate every 1000 decode calls (the destructor log is lost on a forced stop)
     if (moe_cache) {
         static int n_decode_calls = 0;
-        if (++n_decode_calls % 250 == 0) {
+        // LLAMA_MOE_CACHE_STATS_EVERY=N: log every N calls instead (e.g. 10 to see the copies of each prompt)
+        static const int stats_every = [] { const char * env = getenv("LLAMA_MOE_CACHE_STATS_EVERY"); return env && atoi(env) > 0 ? atoi(env) : 250; }();
+        if (++n_decode_calls % stats_every == 0) {
             moe_cache->log_stats();
         }
     }
@@ -2969,6 +2983,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // initialize scheduler with the specified graph
     prefetch_n_tokens = n_tokens;
+    ggml_backend_sched_set_prefetch_depth(sched.get(), prefetch_n_tokens >= prefetch_min_batch ? prefetch_depth_large : prefetch_depth_small);
     if (split_only) {
         if (sizes) {
             ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
@@ -3284,15 +3299,25 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
 
     // the stored routing is used only while the prompt continues: same single sequence at the next position
     const bool cont = ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq[0] == moe_cache_seq && ubatch.pos[0] == moe_cache_pos_next;
-    if (!cont) {
-        moe_cache->clear_seed_counts();
-    }
 
     // a ubatch below the prefetch threshold copies only its routed experts, so it seeds from its own ids (a stored routing could name unstaged experts)
     const bool prefetch = ubatch.n_tokens >= prefetch_min_batch;
 
-    // read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch records newer ones without seeding
-    if (cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || (last_large && prefetch))) {
+    // a deferred seed whose prompt does not go on with a prefetched ubatch: seed from its recorded routing now, from host memory
+    if (moe_cache_seed_pending && (!cont || !large || !prefetch)) {
+        moe_cache_seed_from_host();
+    }
+    if (!cont) {
+        moe_cache->clear_seed_counts();
+    }
+
+    // deferred seeding only for the batches of a single sequence: the stored routing is dropped at the end of a mixed one
+    const bool defer = moe_cache_seed_defer && ubatch.n_seqs_unq == 1;
+
+    // read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch records newer ones
+    // without seeding (deferred: only the prompt's last batch, the one with outputs, seeds from them)
+    const bool seeds_from_prev = large ? (last_large && prefetch && (defer ? n_outputs_ub != 0 : n_outputs_ub == 0)) : n_outputs_ub == 0;
+    if (cont && !moe_cache_ids.empty() && seeds_from_prev) {
         ggml_backend_sched_synchronize(sched.get());
         std::vector<int32_t> ids_data;
         std::vector<int32_t> counts;
@@ -3316,12 +3341,44 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;
     if (last_large) {
-        if (n_outputs_ub == 0 && prefetch && moe_cache->has_seed_counts()) {
+        if (prefetch && moe_cache->has_seed_counts() && (n_outputs_ub == 0 || defer)) {
             moe_cache_seed_prev = true;
+        } else if (defer && prefetch && n_outputs_ub == 0) {
+            // not the end of the prompt (no logits asked): record only, the seed is pending
+            moe_cache_seed_pending = true;
         } else {
             moe_cache_seed = true;
         }
+        if (moe_cache_seed || moe_cache_seed_prev) {
+            moe_cache_seed_pending = false;
+        }
     }
+}
+
+void llama_context::moe_cache_seed_from_host() {
+    moe_cache_seed_pending = false;
+    if (!moe_cache || moe_cache_ids.empty()) {
+        return;
+    }
+    // the routing outputs of the last large ubatch, read before the next graph replaces them; no staged copy of the experts
+    // exists any more, the slots are filled from host memory
+    ggml_backend_sched_synchronize(sched.get());
+    std::vector<int32_t> ids_data;
+    std::vector<int32_t> counts;
+    for (const auto & [w, ids] : moe_cache_ids) {
+        GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ids->buffer != nullptr);
+        ids_data.resize(ggml_nelements(ids));
+        ggml_backend_tensor_get(ids, ids_data.data(), 0, ggml_nbytes(ids));
+        counts.assign(w->ne[2], 0);
+        for (const int32_t id : ids_data) {
+            GGML_ASSERT(id >= 0 && id < w->ne[2]);
+            counts[id]++;
+        }
+        moe_cache->seed_from_host(w, counts);
+    }
+    moe_cache->seed_end();
+    LLAMA_LOG_DEBUG("%s: MoE cache seeded from host memory, %zu layers\n", __func__, moe_cache_ids.size());
+    moe_cache_ids.clear();
 }
 
 void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub) {

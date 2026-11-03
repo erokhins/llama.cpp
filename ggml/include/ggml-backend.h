@@ -380,6 +380,9 @@ extern "C" {
     // a reserve that leaves less than `headroom` bytes free on a device with a staging arena drops the host weight prefetch (0 = never),
     // default GGML_SCHED_PREFETCH_HEADROOM_MIB (512): for users whose memory measurement does not count the staging
     GGML_API void                       ggml_backend_sched_set_prefetch_headroom(ggml_backend_sched_t sched, size_t headroom);
+    // number of staging slots of the host weight prefetch for the next graphs (default GGML_SCHED_PREFETCH_DEPTH, 2): a deeper
+    // pipeline hides the copy jitter of large graphs, a change drains the copies in flight; between graphs only
+    GGML_API void                       ggml_backend_sched_set_prefetch_depth(ggml_backend_sched_t sched, int depth);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

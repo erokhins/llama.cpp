@@ -716,6 +716,56 @@ experts once, (4) the kernel items.
    from the top of the bank after evicting those slots. With that, `-ub 32768` on a 32k context streams the experts once
    and llama.cpp becomes purely compute-bound (today's kernels: ~4,200 tok/s; with 2. maybe 5,000-5,500).
 
+## Update, 2026-11-03: prefill step by step (Avalon ports measured, depth per graph, deferred seeding)
+
+[Avalon](https://github.com/freriadoc/Avalon) (freriadoc, a llama.cpp fork for this model on an RX 7900 XT, clone in
+`testing/ext/avalon`) was reviewed for prefill ideas. What it has that we do not: cached experts read in place by MMQ
+through a per-expert address table (`prefill_residents`, `mmq_args.x_experts`), prefetch slots and compute buffers lent by
+the expert cache (`lend`/`restore`, `GGML_SCHED_BORROW_COMPUTE`), one MMQ scratch (quantized activation + id helper) shared
+by the gate and up nodes, an 8-warp `mm_ids_helper`, and a note that stream-k off gave +11% on an RTX 4090. Its chunked
+GDN prefill kernel is gfx11-only. Note that our fork already serves cached experts to large batches by device-to-device
+copies (`copy_regions_kernel`, 3.6% of the bestgen GPU time), so the in-place read saves SM copy time, not PCIe bytes.
+
+Measured one change at a time with `scripts/pp_step.sh STEP` (prompts of 15k, 30k, 30k tokens; `bestgen` = `-ub 2048`,
+24 GB cache, MTP-3; `c128k` = `-ub 4096`, 12 GB cache, `-c 131072`); server-side tok/s at 30k (the two runs):
+
+| step | bestgen | c128k | kept |
+|---|---|---|---|
+| baseline (4f6b4ff14) | 2,215 / 2,281 | 3,245 / 3,415 | |
+| Avalon `mm_ids_helper` (8 warps per expert, batched id loads) | 2,112 / 2,175 | 3,249 / 3,405 | no: -4.5% bestgen, reproducible (3 runs), 0% c128k |
+| stream-k off (`GGML_CUDA_MMQ_STREAM_K=0`, one block per tile) | 2,082 / 2,134 | 3,248 / 3,400 | no: the Blackwell rule already tiles at >= 90% efficiency; the switch stays as a diagnostic |
+| deferred seeding (`LLAMA_MOE_CACHE_SEED_DEFER`, default on) | 2,234 / 2,260 | 3,317 / 3,369 | yes (neutral on speed, removes the per-batch id readback and the per-ubatch admissions: 24k experts admitted per prompt instead of 3.4k per ubatch) |
+| + prefetch depth 4 for prefetched graphs only (`GGML_SCHED_PREFETCH_DEPTH_LARGE=4`) | 2,556 / 2,575 | 3,974 / 4,052 | +13-15% bestgen, +19-22% c128k, but -2.3% decode (below) |
+| + prefetch depth 3 for prefetched graphs only (**default**) | **2,497 / 2,529** | **3,753 / 3,826** | yes: +11-13% bestgen, +13-15% c128k, -1% decode |
+
+Decode check (`scripts/llama_bench_tf.sh`, 24 GB layout request, MTP-3, 600 tokens, two runs each): old behaviour
+148.7 / 148.5 tok/s, depth 3 for prompts 146.9 / 147.2, depth 4 144.7 / 145.6. The loss is not the pipeline: the staging
+arena is `depth` x the largest expert tensor copy (450 MiB), 0.8 GB at depth 2, 1.35 GB at 3, 1.8 GB at 4, and the memory
+fit takes it from the expert cache (19,497 -> 18,941 -> 18,493 MiB in the log), ~1% of decode per 450 MiB. The deferred
+seeding is neutral for decode (the 89-token prompt of the test is below the prefetch threshold and seeds as before).
+`GGML_SCHED_PREFETCH_DEPTH_LARGE=4` for prompt-heavy servers; a truly neutral deep pipeline needs the arena lent back to
+the cache during generation (item 3 of the plan above), the same mechanism as a larger `-ub`.
+
+Other facts from this pass (bestgen, 15k prompt, Nsight + `LLAMA_MOE_CACHE_STATS_EVERY=8 -lv 4`):
+
+- Per 2048-token ubatch the cache serves 19-22 GB of experts (device copies) and 28.7 GB are uploaded: 61% of the bytes
+  although the cache holds 50% of them. At 57 GB/s the uploads alone take 0.5 s of the 0.8 s a ubatch lasts; the copy
+  engine is 75-80% busy inside a ubatch and the SMs 55-60%. `-ub 2048` is PCIe-bound: the ceiling is ~4,000 tok/s with
+  perfect overlap, and the only ways past it are fewer bytes per token (a larger effective ubatch, see 3. above) or more
+  cache hits for prompts.
+- The MTP draft costs 13-17% of the prompt time: without `-md` the same layout reads 30k at 2,682-2,741 tok/s; with the
+  draft and `--spec-draft-n-ubatch 2048` 2,325-2,395; with the default 64 2,215-2,281. The draft's experts are on the
+  GPU (its host part is the 644 MiB token embedding), so this is its graph cost plus the batch-boundary gap: the timeline
+  shows 80-160 ms dips at every 2048-token batch boundary (graph build, draft chunk, sync).
+- The host thread is busy 77-80% of a ubatch (`GGML_SCHED_TIMING=2`: 740-770 ms per 146-split graph, of which 200-540 ms
+  in input handling, i.e. the copy callback: region planning + `cudaMemcpyBatchAsync` per expert tensor).
+- `CPU_Mapped model buffer size = 27 GB` in the load log is the lazily read per-layer token embeddings, not experts; all
+  experts are in the pinned `CUDA_Host` buffer (48 GB).
+
+Not ported (judged not worth it now): the in-place expert read (~3-4% at best here, and it conflicts with seeding into the
+slots being read; it needs the deferred seed first, which is now in), the MMQ scratch sharing (one of three `mm_ids_helper`
+and one quantize per layer, ~1.5%, needs the scheduler to pair the nodes), the cache lending (the big one, see 3. above).
+
 ## Machine
 
 - RTX 5090 32 GB (driver 610.88, CUDA UMD 13.3).

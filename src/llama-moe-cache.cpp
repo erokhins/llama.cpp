@@ -1356,6 +1356,20 @@ struct llama_moe_cache::impl {
         sd.done |= 1u << b.ip;
     }
 
+    void seed_from_host(const ggml_tensor * w, const std::vector<int32_t> & counts) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return;
+        }
+        const layer & l = layers[it->second.il];
+        ggml_backend_t be = backend(it->second.il);
+        const std::vector<bool> staged(w->ne[2], true);
+        // the host tensor stands in for the staged copy: same expert layout, the batched copies accept a host source
+        for (ggml_tensor * t : l.experts) {
+            seed(be, t, t, counts, staged);
+        }
+    }
+
     void seed_end(group & g) {
         seed_state & sd = g.sd;
         if (sd.il < 0) {
@@ -1663,6 +1677,10 @@ bool llama_moe_cache::seed_check() const {
 
 void llama_moe_cache::seed_verify() {
     pimpl->seed_verify();
+}
+
+void llama_moe_cache::seed_from_host(const ggml_tensor * w, const std::vector<int32_t> & counts) {
+    pimpl->seed_from_host(w, counts);
 }
 
 void llama_moe_cache::seed_end() {

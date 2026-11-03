@@ -450,6 +450,12 @@ private:
     bool moe_cache_seed_prev    = false;
     bool moe_cache_record       = false;
     bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED
+    // LLAMA_MOE_CACHE_SEED_DEFER (default on): a batch without outputs is not the end of the prompt, its last large ubatch
+    // only records its routing (pending); the prompt's last batch seeds from the recorded routing, or moe_cache_seed_from_host
+    // does when the prompt ends elsewhere (another sequence interleaved, a small last batch)
+    bool moe_cache_seed_defer   = true;
+    bool moe_cache_seed_pending = false;
+    void moe_cache_seed_from_host();
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;
@@ -467,6 +473,9 @@ private:
     // ubatches of at least this many tokens prefetch the host weights on the scheduler copy queue, MoE experts whole [GGML_SCHED_PREFETCH_MIN_BATCH]
     // smaller ubatches (e.g. generation) copy only the routed experts or use the MoE cache, with no staging or event work
     int64_t prefetch_min_batch = 256;
+    // staging slots of the prefetch: GGML_SCHED_PREFETCH_DEPTH for small graphs (2), GGML_SCHED_PREFETCH_DEPTH_LARGE for the prefetched ones (3)
+    int prefetch_depth_small = 2;
+    int prefetch_depth_large = 3;
 
     // tokens of the ubatch whose graph the scheduler is allocating, read by sched_prefetch_mode
     int64_t prefetch_n_tokens = 0;
