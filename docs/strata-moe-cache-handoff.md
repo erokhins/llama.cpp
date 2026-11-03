@@ -551,8 +551,15 @@ rebuilt (its KV is resident/streamed without changing the graph). Per round llam
 host time where Strata spends about 1 ms, and the difference is made of many small CUDA API round trips (uploads and
 syncs at 20-70 us each on WDDM), not of one slow stage.
 
+**Done (commit after a8812af73):** `GGML_CUDA_GRAPH_WARMUP=0` (capture a changed graph immediately) and `LLAMA_KV_PAD=N`.
+1200 tokens, same settings: 158.2 (default) -> 161.2 (warmup off) / 160.0 (pad 2048) / **162.3 (both)**; eager runs of the
+large graph 9 -> 0 and of the small graph 164 -> 0. Smaller than the 6% estimated: the rebuild storms were real but the KV
+padding was not their main trigger (pad 2048 only cut the large-graph rebuilds 9 -> 7, the small-graph ones 164 -> 158), so
+most of the draft context's property changes come from elsewhere (to be found: likely n_outputs / recurrent-state inputs of
+the update ubatches). Both switches are opt-in with upstream defaults.
+
 Proposals, in order of value per effort:
-1. Capture CUDA graphs after one stable execution instead of two, or immediately for graphs the width cache owns
+1. (done, see above) Capture CUDA graphs after one stable execution instead of two, or immediately for graphs the width cache owns
    (`warmup_complete` logic in `ggml-cuda.cu`): saves ~45 ms per main-graph change; env-tunable.
 2. Rebuild less often: raise the KV padding from 256 cells so the graph changes every few thousand tokens, or keep the
    graph independent of `n_kv` for the small ubatches.
