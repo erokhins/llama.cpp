@@ -5116,6 +5116,14 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 // GGML_CUDA_GRAPH_TIMING=1: host time of ggml_backend_cuda_graph_compute, split into the update check and the execution
 // (eager launches, capture + instantiate, or graph replay), averaged per graph-size class and logged every 1000 calls
+static bool ggml_cuda_graph_warmup_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_WARMUP");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_cuda_graph_timing_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPH_TIMING");
     return enabled;
@@ -5164,9 +5172,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
             if (gc_timing) { gc_t1 = ggml_time_us(); }
 
+            // GGML_CUDA_GRAPH_WARMUP=0: capture as soon as the properties change instead of running the graph eagerly first
+            // (on Windows WDDM an eager launch costs ~20 us per kernel, far more than a capture of the same graph)
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
+                if (!properties_changed || !ggml_cuda_graph_warmup_enabled()) {
                     graph->warmup_complete = true;
                     if (ggml_cuda_graph_debug_enabled()) {
                         GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
@@ -5177,7 +5187,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
+                if (properties_changed && !ggml_cuda_graph_warmup_enabled()) {
+                    // capture the changed graph right away
+                    use_cuda_graph = true;
+                    cuda_graph_update_required = true;
+                } else if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     if (ggml_cuda_graph_debug_enabled()) {

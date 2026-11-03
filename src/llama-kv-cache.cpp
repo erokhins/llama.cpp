@@ -1257,7 +1257,12 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad = 256;
+    // LLAMA_KV_PAD=N overrides the step (a larger step rebuilds the graph, and re-captures the CUDA graphs, less often as the sequence grows)
+    static const uint32_t n_pad = [] {
+        const char * env = getenv("LLAMA_KV_PAD");
+        const long v = env != nullptr ? atol(env) : 0;
+        return v >= 256 && (v & (v - 1)) == 0 ? (uint32_t) v : (uint32_t) 256;
+    }();
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
