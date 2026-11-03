@@ -511,6 +511,56 @@ Recommended llama.cpp settings now: `-c 32768 -np 2 -b 2048 -ub 2048 --moe-cache
 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-ubatch 64 --backend-sampling --spec-draft-backend-sampling`
 with `LLAMA_MTP_VOCAB=98304`, plus `LLAMA_MOE_CACHE_TAIL_SKIP=7` when Strata-level accuracy is acceptable.
 
+## Update, 2026-11-03: host-side profile of a decode step, llama.cpp vs Strata
+
+Instrumentation (commit 21ff027de, all env-gated): `LLAMA_DECODE_TIMING=1` (phases of `llama_decode` per context, GPU
+wait in `synchronize()`), `GGML_SCHED_TIMING=1` (inside `ggml_backend_sched_compute_splits`), `GGML_CUDA_GRAPH_TIMING=1`
+(CUDA graph update check / execute, eager vs capture vs replay). Run: 89-token prompt, 1200 tokens, 3 drafts, draft
+vocab 98k, backend sampling, width cache on. Logs `builds-bench/llama-bench-dectiming*.log`, `emb-*.log`.
+
+**One draft decode (the MTP context), steady state, host microseconds:**
+
+| phase | us | note |
+|---|---|---|
+| batch init + memory context + apply | ~45 | KV slot search for 1 token |
+| graph reuse check, inputs (`tensor_set` into host buffers) | ~8 | reused with the width cache (52 us of rebuild per call without it) |
+| scheduler compute, of which: | ~130 | |
+| - CUDA graph replay (update check 3.6 + launch 8) | 12 | cheap |
+| - split input upload: pre-sync 37 + `cudaMemcpyAsync` 69 + post-sync 21 | ~125 | **the inputs live in a host buffer and are uploaded by the scheduler every step** |
+| outputs (sampled token copy) | 12 | |
+| GPU wait in `synchronize()` | 314 | the draft graph's GPU time; sequential dependency, cannot overlap |
+| **total per draft step** | **~0.5 host + 0.31 GPU wait ≈ 0.65 ms** | Strata: ~0.3 ms per draft step all-in (1.05 ms/round for 3-4 drafts) |
+
+Moving `token_embd.weight` to the GPU (`-ot/-otd token_embd.weight=CUDA0`) removes the CPU split (1 split instead of 2)
+but not the upload: the remaining inputs (token ids, positions, the hidden state handed over from the main model) are
+still host tensors copied per step, so the cost is unchanged (and 1.5 GB of cache is lost; not worth it).
+
+**The main context per verify decode:** memory context 285 us (KV slot search for 4-5 tokens), inputs 87, outputs 45,
+scheduler ~150 besides the GPU time; graph rebuilds are the expensive part, see below.
+
+**CUDA graph warmup cost under Windows WDDM.** The backend captures a graph only after two consecutive stable
+executions; the executions before that run eagerly, and an eager launch costs about 19 us of host time here. The
+small draft graph (~100 kernels) costs ~2.3 ms per eager run, the main graph (~2,300 kernels) ~43 ms, plus ~5 ms per
+capture. Any change of graph properties pays that: in this run 164 eager small-graph runs and 9 eager large-graph
+runs (the KV cache grows in steps of 256 cells, `n_pad = 256` in `llama-kv-cache.cpp`, and every growth changes the
+graph for every width slot of both contexts), about 0.45 s of 7.6 s, 6%.
+
+**Comparison with Strata's host side** (its own counters, bench mode): plan 0.05 ms, dispatch ~0.06, commit 0.009,
+host 0.02 per round; drafting 1.05 ms per round including GPU; windows captured once per width at start-up and never
+rebuilt (its KV is resident/streamed without changing the graph). Per round llama.cpp spends about 2.6 ms of GPU-idle
+host time where Strata spends about 1 ms, and the difference is made of many small CUDA API round trips (uploads and
+syncs at 20-70 us each on WDDM), not of one slow stage.
+
+Proposals, in order of value per effort:
+1. Capture CUDA graphs after one stable execution instead of two, or immediately for graphs the width cache owns
+   (`warmup_complete` logic in `ggml-cuda.cu`): saves ~45 ms per main-graph change; env-tunable.
+2. Rebuild less often: raise the KV padding from 256 cells so the graph changes every few thousand tokens, or keep the
+   graph independent of `n_kv` for the small ubatches.
+3. Device-resident inputs for the small decodes: place the draft's input tensors on the GPU (one synchronous
+   `cudaMemcpy` of a packed input block instead of the scheduler's sync + async upload + sync), and hand the main
+   model's hidden state to the draft device-to-device instead of through host memory. ~0.65 ms per round.
+4. Then the draft graph's own GPU time (0.31 ms vs Strata ~0.2): smaller MTP experts (Q4) if acceptance allows.
+
 ## Machine
 
 - RTX 5090 32 GB (driver 610.88, CUDA UMD 13.3).
