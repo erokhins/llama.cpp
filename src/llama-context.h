@@ -391,6 +391,17 @@ private:
     // the scheduler of the ubatch being processed: the main one or a width slot's
     ggml_backend_sched_t sched_cur = nullptr;
 
+    // LLAMA_DECODE_TIMING=1: host-side time per phase of llama_decode, averaged over 250 calls and logged per context
+    struct dec_timing_t {
+        int64_t n = 0, n_tokens = 0;
+        int64_t t_total = 0, t_init = 0, t_sync_prev = 0, t_mctx = 0, t_apply = 0, t_reuse = 0, t_build = 0, t_inputs = 0,
+                t_prepare = 0, t_launch = 0, t_launch_sched = 0, t_outputs = 0, t_tail = 0;
+        int n_splits = 0, n_copies = 0;
+    } dec_timing;
+    static bool dec_timing_enabled();
+    bool dec_timing_assignments_printed = false;
+    void dec_timing_report();
+
     bool sched_need_reserve = true;
     bool record_experts_installed = false; // LLAMA_RECORD_EXPERTS, installed at the first decode (not in measurement contexts)
 

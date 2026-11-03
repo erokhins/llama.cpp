@@ -5114,11 +5114,39 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// GGML_CUDA_GRAPH_TIMING=1: host time of ggml_backend_cuda_graph_compute, split into the update check and the execution
+// (eager launches, capture + instantiate, or graph replay), averaged per graph-size class and logged every 1000 calls
+static bool ggml_cuda_graph_timing_enabled() {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPH_TIMING");
+    return enabled;
+}
+
+static void ggml_cuda_graph_timing_add(int n_nodes, bool use_graph, bool captured, int64_t t_check, int64_t t_exec) {
+    struct acc_t { int64_t n = 0, n_eager = 0, n_capture = 0, t_check = 0, t_exec = 0, t_exec_replay = 0, n_replay = 0; };
+    static acc_t acc[2]; // [0] small graphs (< 400 nodes), [1] large
+    static int64_t n_calls = 0;
+    acc_t & a = acc[n_nodes >= 400];
+    a.n++; a.t_check += t_check; a.t_exec += t_exec;
+    if (!use_graph) { a.n_eager++; } else if (captured) { a.n_capture++; } else { a.n_replay++; a.t_exec_replay += t_exec; }
+    if (++n_calls % 1000 == 0) {
+        for (int k = 0; k < 2; ++k) {
+            const acc_t & b = acc[k];
+            if (b.n == 0) continue;
+            GGML_LOG_INFO("cuda graph timing [%s graphs]: %lld computes: eager %lld, captures %lld, replays %lld; host us/compute: update check %.1f, execute %.1f (replays only %.1f)\n",
+                k ? "large" : "small", (long long) b.n, (long long) b.n_eager, (long long) b.n_capture, (long long) b.n_replay,
+                (double) b.t_check/b.n, (double) b.t_exec/b.n, b.n_replay ? (double) b.t_exec_replay/b.n_replay : 0.0);
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->computes = true;
+    const bool  gc_timing = ggml_cuda_graph_timing_enabled();
+    const int64_t gc_t0 = gc_timing ? ggml_time_us() : 0;
+    int64_t gc_t1 = gc_t0;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5134,6 +5162,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            if (gc_timing) { gc_t1 = ggml_time_us(); }
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -5175,6 +5204,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
+    if (gc_timing) {
+        ggml_cuda_graph_timing_add(cgraph->n_nodes, use_cuda_graph, cuda_graph_update_required, gc_t1 - gc_t0, ggml_time_us() - gc_t1);
+    }
     return GGML_STATUS_SUCCESS;
 }
 

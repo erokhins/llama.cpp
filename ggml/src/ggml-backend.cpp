@@ -2427,6 +2427,10 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+static bool ggml_sched_timing_enabled();
+extern int64_t g_sched_timing_upload_sync;
+extern int64_t g_sched_timing_upload_set;
+
 // without pipeline parallelism, a host split input is queued as an async upload instead of a sync copy (2 host syncs per input)
 // the caller synchronizes the split backend once after all of them, so the host data can be overwritten when compute_splits moves on
 static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool & synced) {
@@ -2465,18 +2469,50 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
 
     if (!synced) {
         // wait for the split backend to finish using its input copies before overwriting them
+        const int64_t u0 = ggml_sched_timing_enabled() ? ggml_time_us() : 0;
         ggml_backend_synchronize(split_backend);
+        if (u0) { g_sched_timing_upload_sync += ggml_time_us() - u0; }
         synced = true;
     }
     if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
         // produced by an earlier split
         ggml_backend_synchronize(ggml_backend_sched_get_tensor_backend(sched, input));
     }
-    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+    { const int64_t v0 = ggml_sched_timing_enabled() ? ggml_time_us() : 0; ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input)); if (v0) { g_sched_timing_upload_set += ggml_time_us() - v0; } }
     return true;
 }
 
+// GGML_SCHED_TIMING=1: host time of ggml_backend_sched_compute_splits per call (total, inside backend graph compute, input copies,
+// synchronisations), averaged by split count and logged every 1000 calls
+int64_t g_sched_timing_upload_sync = 0;
+int64_t g_sched_timing_upload_set  = 0;
+
+static bool ggml_sched_timing_enabled() {
+    static const bool enabled = getenv("GGML_SCHED_TIMING") != nullptr && atoi(getenv("GGML_SCHED_TIMING")) != 0;
+    return enabled;
+}
+
+static void ggml_sched_timing_add(int n_splits, int64_t t_total, int64_t t_compute, int64_t t_copy, int64_t t_sync, int64_t t_cpu, int64_t t_pf, int64_t t_ev) {
+    struct acc_t { int64_t n = 0, total = 0, compute = 0, copy = 0, sync = 0, cpu = 0, pf = 0, ev = 0; };
+    static acc_t acc[8]; // by split count 1..7, 0 = more
+    static int64_t n_calls = 0;
+    acc_t & a = acc[n_splits >= 1 && n_splits < 8 ? n_splits : 0];
+    a.n++; a.total += t_total; a.compute += t_compute; a.copy += t_copy; a.sync += t_sync; a.cpu += t_cpu; a.pf += t_pf; a.ev += t_ev;
+    if (++n_calls % 1000 == 0) {
+        for (int k = 0; k < 8; ++k) {
+            if (acc[k].n == 0) continue;
+            GGML_LOG_INFO("sched timing [%d splits]: %lld computes, host us/compute: total %.1f = backend compute %.1f + input copies %.1f + syncs %.1f + rest %.1f; of the compute %.1f on CPU splits; input handling %.1f (upload pre-sync %.1f, set_async %.1f), event records %.1f\n",
+                k, (long long) acc[k].n, (double) acc[k].total/acc[k].n, (double) acc[k].compute/acc[k].n, (double) acc[k].copy/acc[k].n,
+                (double) acc[k].sync/acc[k].n, (double) (acc[k].total - acc[k].compute - acc[k].copy - acc[k].sync)/acc[k].n,
+                (double) acc[k].cpu/acc[k].n, (double) acc[k].pf/acc[k].n, (double) g_sched_timing_upload_sync/n_calls, (double) g_sched_timing_upload_set/n_calls, (double) acc[k].ev/acc[k].n);
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+    const bool    sct = ggml_sched_timing_enabled();
+    const int64_t sct0 = sct ? ggml_time_us() : 0;
+    int64_t sct_compute = 0, sct_sync = 0, sct_copy = 0, sct_cpu = 0, sct_pf = 0, sct_ev = 0;
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -2488,7 +2524,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         pf->consumed = 0;
         // the copies of this graph run after the work queued on the backend before it (e.g. earlier graphs writing memory a copy callback reads)
         if (sched->pf_active && pf->n_async > 0 && pf->start != NULL) {
-            ggml_backend_event_record(pf->start, sched->backends[b]);
+            { const int64_t e0 = sct ? ggml_time_us() : 0; ggml_backend_event_record(pf->start, sched->backends[b]); if (sct) { sct_ev += ggml_time_us() - e0; } }
             ggml_backend_event_wait(pf->copy_backend, pf->start);
             pf->pending = true;
         }
@@ -2500,21 +2536,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
         if (sched->pf_active) {
-            ggml_backend_sched_prefetch_issue(sched);
+            { const int64_t p0 = sct ? ggml_time_us() : 0; ggml_backend_sched_prefetch_issue(sched); if (sct) { sct_pf += ggml_time_us() - p0; } }
         }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+                { const int64_t y0 = sct ? ggml_time_us() : 0; ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]); if (sct) { sct_sync += ggml_time_us() - y0; } }
             } else {
-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                { const int64_t y0 = sct ? ggml_time_us() : 0; ggml_backend_synchronize(sched->backends[prev_backend_id]); if (sct) { sct_sync += ggml_time_us() - y0; } }
             }
         }
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        const int64_t in0 = sct ? ggml_time_us() : 0;
         bool upload_synced  = false;
         bool upload_pending = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -2523,19 +2560,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     upload_pending = true;
                     continue;
                 }
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                { const int64_t k0 = sct ? ggml_time_us() : 0; ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]); if (sct) { sct_copy += ggml_time_us() - k0; } }
             }
         }
         if (upload_pending) {
             // queued before the wait on the prefetched copies of this split, so it never waits for the copy queue
-            ggml_backend_synchronize(split_backend);
+            { const int64_t y0 = sct ? ggml_time_us() : 0; ggml_backend_synchronize(split_backend); if (sct) { sct_sync += ggml_time_us() - y0; } }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 if (split->pf_async && ggml_backend_sched_prefetch_is_bound(sched, split, split->inputs[input_id])) {
                     continue; // already issued on the copy queue
                 }
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                { const int64_t k0 = sct ? ggml_time_us() : 0; ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]); if (sct) { sct_copy += ggml_time_us() - k0; } }
             }
         }
 
@@ -2549,10 +2586,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sct) { sct_pf += ggml_time_us() - in0; } // input handling of the split (reusing the prefetch counter)
         if (!sched->callback_eval) {
+            const int64_t c0 = sct ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (sct) { const int64_t dc = ggml_time_us() - c0; sct_compute += dc; if (ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) { sct_cpu += dc; } }
             if (ec != GGML_STATUS_SUCCESS) {
-                ggml_backend_sched_prefetch_drain(sched);
+                { const int64_t p0 = sct ? ggml_time_us() : 0; ggml_backend_sched_prefetch_drain(sched); if (sct) { sct_pf += ggml_time_us() - p0; } }
                 return ec;
             }
         } else {
@@ -2575,7 +2615,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
-                    ggml_backend_sched_prefetch_drain(sched);
+                    { const int64_t p0 = sct ? ggml_time_us() : 0; ggml_backend_sched_prefetch_drain(sched); if (sct) { sct_pf += ggml_time_us() - p0; } }
                     return ec;
                 }
 
@@ -2592,19 +2632,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            { const int64_t e0 = sct ? ggml_time_us() : 0; ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend); if (sct) { sct_ev += ggml_time_us() - e0; } }
         }
 
         // the slot can be refilled once this split has been computed
         if (pf_split) {
-            ggml_backend_event_record(sched->pf[split_backend_id].retire[pf_slot], split_backend);
+            { const int64_t e0 = sct ? ggml_time_us() : 0; ggml_backend_event_record(sched->pf[split_backend_id].retire[pf_slot], split_backend); if (sct) { sct_ev += ggml_time_us() - e0; } }
             sched->pf[split_backend_id].consumed++;
-            ggml_backend_sched_prefetch_issue(sched);
+            { const int64_t p0 = sct ? ggml_time_us() : 0; ggml_backend_sched_prefetch_issue(sched); if (sct) { sct_pf += ggml_time_us() - p0; } }
         }
 
         prev_backend_id = split_backend_id;
     }
 
+    if (sct) { ggml_sched_timing_add(sched->n_splits, ggml_time_us() - sct0, sct_compute, sct_copy, sct_sync, sct_cpu, sct_pf, sct_ev); }
     return GGML_STATUS_SUCCESS;
 }
 

@@ -971,10 +971,12 @@ void llama_context::synchronize() {
         return;
     }
 
+    const int64_t st0 = dec_timing_enabled() ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
     for (auto & [n, slot] : width_slots) {
         ggml_backend_sched_synchronize(slot.sched.get());
     }
+    if (st0) { dec_timing.t_sync_prev += ggml_time_us() - st0; }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1608,11 +1610,15 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const int64_t pt0 = dec_timing_enabled() ? ggml_time_us() : 0;
+    int64_t pt = pt0;
+    auto plap = [&](int64_t & acc) { if (pt0) { const int64_t now = ggml_time_us(); acc += now - pt; pt = now; } };
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    plap(dec_timing.t_apply);
 
     // small decode ubatches may use a per-width slot with its own scheduler and graph result
     width_slot * slot = nullptr;
@@ -1644,6 +1650,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        plap(dec_timing.t_reuse);
     } else {
         active = nullptr;
         res->reset();
@@ -1672,6 +1679,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         active               = res;
         moe_cache_seed_graph = moe_cache_seed;
+        plap(dec_timing.t_build);
     }
 
     // set the input data for the input tensors
@@ -1680,6 +1688,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+        plap(dec_timing.t_inputs);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1687,8 +1696,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (moe_cache) {
         moe_cache->prepare(ubatch.n_tokens);
     }
+    plap(dec_timing.t_prepare);
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    plap(dec_timing.t_launch);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1944,6 +1955,9 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    const int64_t dt0 = dec_timing_enabled() ? ggml_time_us() : 0;
+    int64_t dt = dt0;
+    auto lap = [&](int64_t & acc) { if (dt0) { const int64_t now = ggml_time_us(); acc += now - dt; dt = now; } };
     // diagnostics: log the MoE cache hit rate every 1000 decode calls (the destructor log is lost on a forced stop)
     if (moe_cache) {
         static int n_decode_calls = 0;
@@ -2013,6 +2027,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    lap(dec_timing.t_init);
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
@@ -2154,6 +2169,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
 
     do {
+        lap(dec_timing.t_mctx);
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch
@@ -2184,7 +2200,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
+        lap(dec_timing.t_mctx);
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (dt0) { dt = ggml_time_us(); }
 
         if (moe_cache) {
             moe_cache_seed_end(ubatch, res ? n_outputs : -1);
@@ -2349,6 +2367,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched_cur, &sampling.candidates_count);
         }
 
+        lap(dec_timing.t_outputs);
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -2406,7 +2425,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    if (dt0) {
+        lap(dec_timing.t_tail);
+        dec_timing.t_total  += ggml_time_us() - dt0;
+        dec_timing.n_tokens += n_tokens_all;
+        if (++dec_timing.n % 250 == 0) {
+            dec_timing_report();
+        }
+    }
+
     return 0;
+}
+
+bool llama_context::dec_timing_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_DECODE_TIMING");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+void llama_context::dec_timing_report() {
+    const auto & d = dec_timing;
+    const double n = (double) std::max<int64_t>(1, d.n);
+    LLAMA_LOG_INFO("decode timing [%u layers]: %lld calls, %.2f tokens/call, host us/call: decode %.0f = init %.0f + mctx %.0f + apply %.0f + reuse-check %.0f + build+alloc %.0f + inputs %.0f + moe-prepare %.0f + launch %.0f (of which sched compute %.0f) + outputs %.0f + tail %.0f; gpu wait in synchronize() %.0f us/call; last graph: %d splits, %d copies\n",
+        (unsigned) model.layers.size(), (long long) d.n, (double) d.n_tokens/n, d.t_total/n, d.t_init/n, d.t_mctx/n, d.t_apply/n,
+        d.t_reuse/n, d.t_build/n, d.t_inputs/n, d.t_prepare/n, d.t_launch/n, d.t_launch_sched/n, d.t_outputs/n, d.t_tail/n, d.t_sync_prev/n, d.n_splits, d.n_copies);
 }
 
 //
@@ -2983,7 +3027,22 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    const int64_t gt0 = dec_timing_enabled() ? ggml_time_us() : 0;
     auto status = ggml_backend_sched_graph_compute_async(sched_cur, gf);
+    if (gt0) { dec_timing.t_launch_sched += ggml_time_us() - gt0; dec_timing.n_splits = ggml_backend_sched_get_n_splits(sched_cur); dec_timing.n_copies = ggml_backend_sched_get_n_copies(sched_cur); }
+    if (gt0 && !dec_timing_assignments_printed && ggml_graph_n_nodes(gf) < 400) {
+        // once per context: where the small graph changes backend (the CPU split and the inputs it feeds)
+        dec_timing_assignments_printed = true;
+        ggml_backend_t prev = nullptr;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched_cur, node);
+            if (b != prev) {
+                LLAMA_LOG_INFO("decode timing: node %3d %-28s op %-14s on %s (src0 %s)\n", i, node->name, ggml_op_name(node->op), b ? ggml_backend_name(b) : "?", node->src[0] ? node->src[0]->name : "-");
+                prev = b;
+            }
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
