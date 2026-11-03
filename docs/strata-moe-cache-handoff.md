@@ -785,6 +785,53 @@ no gate/up/SwiGLU fusion for MoE, f32->bf16 converts, `mm_ids_helper` per matmul
 `pp-ub16k-*`. Note `--phase-aware-workspace` (commit 3d8925f7c) already releases the compute buffers between prompts;
 what is missing is the cache growing into the freed VRAM (fixed `cudaMalloc`, sized at startup for the full reservation).
 
+## Update, 2026-11-03: Strata vs llama.cpp prefill at equal chunk size, stage by stage
+
+Tooling: `scripts/strata_pp_engine.py NAME [sizes] -- [engine args]` drives `strata.exe --serve` over its stdin protocol
+(`GEN 1 <ids>`; the HTTP server is the Strata terminal's Python, `strata.exe --serve` alone is a stdin/stdout engine that
+exits on EOF) with `STRATA_PREFILL_TIMING=1`, which prints the engine's own per-phase GPU timeline per prompt chunk
+(`strata prefill timing: ...` on stderr; a layer-major timeline, waits charged to the waiting phase). Prompts are the
+pp_bench corpus tokenized with `llama-tokenize` (same vocabulary). llama.cpp side: `scripts/nsys_prefill.sh` +
+`nsys_prefill.py` (kernel families). Files: `builds-bench/strata-pp-*.json/.engine.log`, `builds-bench/nsys-ub8k-stage*`.
+
+### Chunk size sweep, same prompts (tok/s from wall time, 15k / 30k prompt; Strata = `--prefill N`, llama.cpp = `-ub N`)
+
+| chunk | Strata | llama.cpp (12 GB cache, depth 3) |
+|---|---|---|
+| 2048 | 3,146 / 3,444 | ~2,700 at 30k (24 GB cache, no MTP) |
+| 4096 | 4,766 / 5,567 | 3,415 at 30k |
+| 8192 | 5,640 / 6,880 | 4,322-4,725 / 4,456-4,571 |
+| 16384 | | 4,111-4,524 / 4,254-4,420 |
+| 32768 (`auto:32768`) | 5,887 / 7,026 | |
+
+Strata gains little above 8192 as well (+2-4%). Its 15k prompts are slower than its 30k ones because the chunked path
+leaves a 542-token tail that goes through the small-batch path (dequant of the routed experts): 0.5 s for 542 tokens, i.e.
+~1 ms/token, while the 14.75k-token body costs 0.136 ms/token. At 2048 Strata is itself traffic-bound (`wait copy` 10%,
+`kv stage` 18% of its timeline) and only 1.27x ahead of llama.cpp; at 8192 it is 1.5x ahead on pure kernel time.
+
+### Stage by stage at chunk 8192, ms per 1,000 prompt tokens
+
+llama.cpp: 15.3k-token prompt, `-ub 8192 -c 32768 -np 1 --moe-cache-mib 12288`, nsys kernel sums (3,150 ms kernels,
+3,597 ms server prompt time; GPU 91-99% kernel-busy inside each ubatch, a ~180 ms dip at the ubatch boundary).
+Strata: 14.75k-token chunk timeline, 2,005 ms GPU = 2,012 ms wall.
+
+| stage | llama.cpp | Strata | diff | notes |
+|---|---|---|---|---|
+| expert GEMMs | 57 | 36 | +21 | MMQ on IQ4_NL/IQ2_S/IQ3_XXS/IQ3_S experts (J=128 tiles, ~160 rows per expert) vs Strata's fused int8 expert kernels (SwiGLU + activation quantization in the epilogue, one launch per 128 experts) |
+| expert plumbing | 34 | 9 | +25 | `mm_ids_helper` x3 per layer 14, q8_1 quantize x3 6, weighted reduction 4, SwiGLU/sigmoid gates 4.6, `copy_regions` D2D from the cache 5.2 vs router+shared 4.4, gather 0.5, combine 3.8 |
+| dense projections (attention, GDN in/out, HC up/down) | 34 | ~40 | -6 | MMQ Q6_K/Q5_K/Q4_K + cuBLAS 34 vs qsa proj 9.8 + gdn proj 17.2 + gdn out 6.4 + hc up/down ~7: llama.cpp's dense matmuls are not the problem |
+| attention core | 21 | 10 | +11 | dense flash attention with an [n_kv x n_tokens] mask 17.7 + indexer/top-k 2.2 + rope 1.3 vs sparse attention over the selected keys 7.3 + select 2.8 + indexer 0.3 |
+| GDN core (conv + recurrence) | 12.7 | 20.4 | -8 | llama.cpp's `gdn_single` MMA kernel is faster than Strata's recurrence |
+| hyper-connection + norms + f32->bf16 converts | 29 | 15 | +14 | `dsv4_hc_pre/post` 11.4, 1,908 `convert_unary` 8.9, 2,000 `rms_norm` 8.9 vs hc write 7.2 + mix/inject 7.7 (norm fused into the write) |
+| other elementwise (concat, cpy, bin_bcast, misc) | 18 | ~4 | +14 | |
+| host gaps, ubatch boundary, launch gaps | 29 | ~0.5 | +28 | 3,597 server ms - 3,150 kernel ms; Strata's wall = timeline |
+| **total** | **235** | **136** | **+99** | |
+
+So of the 99 ms/1k gap: ~28 host/launch overhead (CUDA-graph-less prompt graphs, ~1,700 launches per ubatch, the
+ubatch boundary), ~25 expert plumbing (three id sorts and three activation quantizations per layer where one would do,
+the cache D2D copies that in-place reads would remove, unfused gates/reduction), ~21 expert GEMM kernels, ~28 fusion of
+the elementwise/HC/norm soup, ~11 dense-vs-sparse attention; llama.cpp is ahead by ~14 on GDN and dense matmuls.
+
 ## Machine
 
 - RTX 5090 32 GB (driver 610.88, CUDA UMD 13.3).
