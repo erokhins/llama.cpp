@@ -1671,6 +1671,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         prefetch_n_tokens = ubatch.n_tokens;
+        // LLAMA_GRAPH_INPUTS_ON_DEVICE=1|2: the input tensors of a width-slot graph live on the first (GPU) backend and are set with
+        // direct copies, instead of host buffers the scheduler uploads with a sync before and after (~125 us per step on Windows);
+        // 2 applies it only to small (draft) models whose weights are all on the device
+        if (slot != nullptr) {
+            static const int inputs_on_device = [] { const char * env = getenv("LLAMA_GRAPH_INPUTS_ON_DEVICE"); return env ? atoi(env) : 0; }();
+            if (inputs_on_device == 1 || (inputs_on_device == 2 && model.layers.size() <= 2)) {
+                ggml_backend_t dev_backend = backends.front().get();
+                if (dev_backend != backend_cpu) {
+                    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                        ggml_tensor * node = ggml_graph_node(gf, i);
+                        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                            ggml_tensor * src = node->src[j];
+                            // only inputs filled with ggml_backend_tensor_set; the KV/recurrent index and mask inputs are written as host memory
+                            if (src && (src->flags & GGML_TENSOR_FLAG_INPUT) && src->buffer == nullptr && src->view_src == nullptr &&
+                                    (strncmp(src->name, "inp_tokens", 10) == 0 || strncmp(src->name, "inp_pos", 7) == 0 ||
+                                     strncmp(src->name, "inp_out_ids", 11) == 0 || strncmp(src->name, "inp_embd", 8) == 0 ||
+                                     strcmp(src->name, "mtp_h_input") == 0)) {
+                                ggml_backend_sched_set_tensor_backend(sched_cur, src, dev_backend);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if (!ggml_backend_sched_alloc_graph(sched_cur, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;

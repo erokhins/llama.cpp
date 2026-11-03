@@ -2467,6 +2467,13 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
         return false;
     }
 
+    if (ggml_sched_timing_enabled()) {
+        static int n_printed = 0;
+        if (n_printed < 12) {
+            n_printed++;
+            GGML_LOG_INFO("sched timing: uploaded split input '%s' (%s, %zu bytes, flags %d) from buffer %s to %s\n", input->name, ggml_op_name(input->op), ggml_nbytes(input), (int) input->flags, ggml_backend_buffer_name(input->buffer), ggml_backend_name(split_backend));
+        }
+    }
     if (!synced) {
         // wait for the split backend to finish using its input copies before overwriting them
         const int64_t u0 = ggml_sched_timing_enabled() ? ggml_time_us() : 0;
