@@ -668,7 +668,26 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // LLAMA_MTP_VOCAB=N (draft model only): the draft head scores only the first N token ids (BPE ids are roughly frequency ordered:
+    // ids below 98304 cover 99.7% of the generated tokens here), the rest get -inf; the full-vocabulary GEMV is most of a draft step
+    static const int64_t n_vocab_draft = [] {
+        const char * env = getenv("LLAMA_MTP_VOCAB");
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 0;
+    }();
+    ggml_tensor * out_w = model.output;
+    ggml_tensor * out_s = model.output_s;
+    const bool    crop  = n_vocab_draft > 0 && n_vocab_draft < model.output->ne[1];
+    if (crop) {
+        out_w = ggml_view_2d(ctx0, out_w, out_w->ne[0], n_vocab_draft, out_w->nb[1], 0);
+        if (out_s) {
+            out_s = ggml_view_1d(ctx0, out_s, n_vocab_draft, 0);
+        }
+    }
+    cur = build_lora_mm(out_w, cur, out_s);
+    if (crop) {
+        ggml_tensor * pad = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, model.output->ne[1] - n_vocab_draft, cur->ne[1]), -INFINITY);
+        cur = ggml_concat(ctx0, cur, pad, 0);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
