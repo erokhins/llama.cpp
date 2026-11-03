@@ -2385,11 +2385,23 @@ static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched) {
     }
 }
 
+static bool ggml_sched_timing_enabled();
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+    if (ggml_sched_timing_enabled()) {
+        // GGML_SCHED_TIMING: which inputs go through the synchronous copy path (first 40 of a process)
+        static int n_printed = 0;
+        if (n_printed < 60 && sched->n_splits >= 100) {
+            n_printed++;
+            GGML_LOG_INFO("sched timing: sync copy_input '%s' (%s, %zu bytes, flags %d, host weight %d) from %s to %s, split %d nodes\n",
+                input->name, ggml_op_name(input->op), ggml_nbytes(input), (int) input->flags, (int) ggml_backend_sched_is_host_weight(input),
+                input_backend ? ggml_backend_name(input_backend) : "?", ggml_backend_name(split_backend), split->graph.n_nodes);
+        }
+    }
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -2505,6 +2517,12 @@ static void ggml_sched_timing_add(int n_splits, int64_t t_total, int64_t t_compu
     static int64_t n_calls = 0;
     acc_t & a = acc[n_splits >= 1 && n_splits < 8 ? n_splits : 0];
     a.n++; a.total += t_total; a.compute += t_compute; a.copy += t_copy; a.sync += t_sync; a.cpu += t_cpu; a.pf += t_pf; a.ev += t_ev;
+    // GGML_SCHED_TIMING=2: also print every graph with 8 or more splits (e.g. prompt processing with host weights) on its own
+    static const bool each_large = getenv("GGML_SCHED_TIMING") != nullptr && atoi(getenv("GGML_SCHED_TIMING")) >= 2;
+    if (each_large && n_splits >= 8) {
+        GGML_LOG_INFO("sched timing [%d splits]: one compute, host ms: total %.1f = backend compute %.1f + input copies %.1f + syncs %.1f + rest %.1f; input handling %.1f, event records %.1f\n",
+            n_splits, t_total/1e3, t_compute/1e3, t_copy/1e3, t_sync/1e3, (t_total - t_compute - t_copy - t_sync)/1e3, t_pf/1e3, t_ev/1e3);
+    }
     if (++n_calls % 1000 == 0) {
         for (int k = 0; k < 8; ++k) {
             if (acc[k].n == 0) continue;

@@ -242,6 +242,16 @@ void ggml_cuda_mul_mat_q(
             if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
             }
+            // GGML_CUDA_MMQ_ID_NCOLS (experiment): 0 = per-expert average like RDNA, N > 0 = pick the tile for N columns
+            static const int mmq_id_ncols = [] {
+                const char * env = getenv("GGML_CUDA_MMQ_ID_NCOLS");
+                return env ? atoi(env) : -1;
+            }();
+            if (mmq_id_ncols == 0) {
+                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            } else if (mmq_id_ncols > 0) {
+                ncols_opt = std::min<int64_t>(ne12, mmq_id_ncols);
+            }
         }
 
         J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);

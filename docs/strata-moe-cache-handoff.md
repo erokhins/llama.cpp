@@ -584,6 +584,138 @@ Proposals, in order of value per effort:
    model's hidden state to the draft device-to-device instead of through host memory. ~0.65 ms per round.
 4. Then the draft graph's own GPU time (0.31 ms vs Strata ~0.2): smaller MTP experts (Q4) if acceptance allows.
 
+## Update, 2026-11-03: prompt processing (prefill), why llama.cpp reads prompts 2x slower than Strata
+
+Tools added: `scripts/pp_bench.py` (prefill-only: 1k/4k/15k/30k prompts, unique prefixes, server-side `prompt_ms`),
+`scripts/pp_run.sh BIN_DIR NAME [server flags]` (start, bench, graceful stop; `PP_SIZES=chars,...`), `scripts/nsys_prefill.sh`
++ `scripts/nsys_prefill.py` (Nsight trace of one prompt: copy-vs-compute breakdown, `--timeline 100`), `scripts/pcie_bench.cu`
+(pinned H2D microbenchmark). Server-side prompt tok/s unless noted. Strata measured the same day with the same script.
+
+### Measurements
+
+| Config (30k prompt unless noted) | 1.3k | 4.2k | 15k | 30k |
+|---|---|---|---|---|
+| **Strata** (serve, `--prefill auto`, 32k chunks) | 1,794 | 5,220 | 6,992 | **7,266** |
+| llama.cpp best-gen config: `-c 32768 -np 2 -ub 2048 --moe-cache-mib 24000` + MTP-3 stack | 1,281 | 1,773 | 2,197 | 2,290 |
+| llama.cpp 128k config: `-c 131072 -np 4 -ub 4096 --moe-cache-mib 12288` | 1,481 | 2,890 | 3,419 | 3,400 |
+| same + `GGML_SCHED_PREFETCH_DEPTH=4` | | | 4,069 | 3,765 |
+| same + `LLAMA_MOE_CACHE_SEED=0` | | | 3,140 | 3,194 |
+| `-c 32768 -np 1 -ub 4096 --moe-cache-mib 20480`, depth 4 | | | 3,677 | 3,932 |
+| `-c 32768 -np 1 -ub 8192 --moe-cache-mib 16384`, depth 2 | | | 3,781 | 4,008 |
+| same, depth 4 | | | 3,852 | **4,133** |
+| same, depth 8 (cache 14336) | | | 3,822 | 4,114 |
+
+Memory (`-lv 4`): `-ub 8192 -c 32768` compute buffer 4,214 MiB CUDA + 531 MiB host (about 0.5 MiB per ubatch token);
+host experts 43.6 GB pinned (`CUDA_Host model buffer`), staging arena 794 MiB at depth 2 (2 x largest split 450 MiB).
+
+PCIe (`scripts/pcie_bench.cu`, RTX 5090 at PCIe 5.0 x16): pinned H2D 56.7 GB/s for 1 GiB, 46.5 GB/s in 627 KB pieces,
+54.3 GB/s with `cudaMemcpyBatchAsync`, 17.6 GB/s from pageable memory. llama.cpp's uploads run at **57.1 GB/s effective**
+(Nsight), so the link is used at full speed; the problem is not the copy rate.
+
+### Nsight Systems, one 15k prompt, `-ub 4096 -c 131072 --moe-cache-mib 12288` (depth 2)
+
+Prompt 4,559 ms. GPU busy 82% of the window; kernels busy 3,204 ms; **H2D 143 GB in 1,753 copies, 2,507 ms busy**
+(36 GB per 4096-token ubatch: every host expert tensor is re-uploaded for every ubatch, minus the cached experts which are
+copied device-to-device by `copy_regions_kernel`, 110 ms); H2D overlapped with kernels only 1,186 ms, kernels alone 2,019,
+H2D alone 1,321, idle 996. Within a ubatch the 100 ms timeline shows H2D at ~65% and kernels at ~70%, both unsaturated.
+
+Why (per layer, ~21 ms): the scheduler makes **one split per expert weight tensor** (gate, up, down: "eligible splits = 131
+of 134"), and the prefetch depth is 2, so the copy of split k+1 can start only when split k-1 has finished computing. The
+`down` copy (450 MiB, ~8 ms) has only the `up` matmul (~2.5 ms) to hide behind, the `up` copy only the `gate` matmul: the
+compute stream waits 6-11 ms per layer right after the SwiGLU ("gap after `unary_gated_op_kernel`, ends when an H2D copy
+ends": 74 of 75 kernel gaps), and the copy engine idles during the attention half. Depth 4 (`GGML_SCHED_PREFETCH_DEPTH=4`,
++0.9 GB staging) removes the stall: +20% at 15k, +10% at 30k.
+
+Kernel time by family (ms of 3,204): quantized matmul 1,502 (experts 1,059: IQ4_NL down 404, IQ2_S 256, IQ3_XXS 172,
+IQ3_S 104, Q2_0 93; dense Q6_K/Q5_K/Q4_K 316), elementwise/other 570 (`mm_ids_helper` 147, f32->bf16 convert 121,
+`copy_regions_kernel` 110 on the copy stream, concat 58, weighted reduction 54, SwiGLU 31, q8_1 quantize 74), flash
+attention 232, gated delta net 194, hyper-connection 169, cuBLAS 145, norm 135, copies 97, router 60, indexer 28.
+
+### Where the 2x comes from (30k prompt, best-gen config 13.1 s vs Strata 4.15 s)
+
+1. **Bytes re-streamed per ubatch.** llama.cpp uploads every non-cached expert tensor once per ubatch: 15 ubatches x 26 GB
+   = 390 GB (6.8 s at 57 GB/s) with `-ub 2048`; 8 x 36 GB = 288 GB (5 s) with `-ub 4096` and the 12 GB cache. Strata's
+   chunk is the whole prompt up to 32k tokens (`--prefill auto:32768`), so it streams each non-resident expert **once**
+   per prompt (~0.6 s, hidden under compute). Strata affords the chunk by *borrowing expert-cache slots* for the chunk's
+   buffers (the lent experts stream during the prompt and are refilled afterwards, `generate.cpp` ~8535-8668); llama.cpp's
+   cache is a fixed `cudaMalloc`, so a bigger `-ub` permanently costs cache (0.5 MiB per token: `-ub 8192` = 4.2 GB).
+2. **Pipeline bubbles** (per-tensor splits, depth 2): copy engine and SMs each ~65-70% busy. Fixed by depth 4 (or merging
+   the three weight splits of a layer; same staging cost).
+3. **Compute.** With copies hidden (`-ub 8192`, depth 4) llama.cpp is compute-bound at **4,100-4,200 tok/s = 0.24 ms per
+   token**; Strata's whole prompt costs 0.138 ms per token. Kernel busy time is 0.21 ms/token (the rest is launch gaps:
+   prefill graphs are not CUDA graphs, ~1,700 launches per ubatch, 134 splits with event waits). Strata's prompt path:
+   fused int8 expert kernels with SwiGLU + activation quantization in the epilogue, one launch per 128 experts (gate/up
+   and down each), GPU-side grouping without host sync, blockwise indexer scoring (no [n_kv x n_tokens] mask), HC norm
+   fused into the previous write (see "Strata prefill pipeline" notes below).
+   llama.cpp specifics found: MMQ picks the token-tile width J from the total token count (`ncols_opt = ne12`, J = 128)
+   although each expert sees only `n_tokens*10/512` rows (80 at `-ub 4096`, 160 at 8192), so tiles are 40-60% empty (RDNA
+   already uses the per-expert average; experiment `GGML_CUDA_MMQ_ID_NCOLS`, results below); `mm_ids_helper` is run for
+   every `mul_mat_id` of a layer with the same ids (one warp per expert scanning all ids: 147 ms per 15k tokens); gate/up
+   MMQ fusion exists for `mul_mat` but asserts `!ids` for MoE; dense activations are converted f32->bf16 for every BF16
+   hyper-connection matmul (121 ms).
+
+MMQ tile width for MoE (`GGML_CUDA_MMQ_ID_NCOLS`, `-ub 8192`, depth 4, 15k prompt): J = 128 (default) 3,832 tok/s,
+J = 96 3,694, J = 80 (per-expert average, the RDNA rule) 3,594, J = 64 3,448, J = 32 2,842. **Narrower tiles are slower**
+even though each expert fills only part of a 128-wide tile: MMQ's cost per tile is dominated by the weight dequantization
+into shared memory, which a wider tile amortizes over more tokens. The expert MMQ runs at ~100-115 TFLOPS (1.2-1.6 ms per
+layer per 4096-token ubatch for 134 GFLOP); a faster MoE GEMM needs a different kernel, not a tile parameter.
+
+Also checked: `LLAMA_MOE_CACHE_SEED=0` does not help (seeding is not the bottleneck); host-side scheduler time
+(`GGML_SCHED_TIMING=2`, new: prints every graph with >= 8 splits) shows no blocking syncs in the compute-bound config
+(syncs 6-8 ms per ubatch).
+
+### The first ubatch of every prompt runs synchronously (found with `GGML_SCHED_TIMING=2` and a copy_input trace)
+
+Nsight of `-ub 8192`, depth 4, 15k prompt: ubatch 1 runs kernels at 60-75% busy and the host sits **1.9 s inside
+`ggml_backend_sched_copy_input`**; ubatch 2 runs at 99%. The expert weights of ubatch 1 take the synchronous copy path
+(ids read back, device sync, copies on the compute stream) although the prefetch arena is bound ("134 async splits").
+Cause: `last_large` in `llama_context::decode` is computed per `llama_decode` batch, so with `-b == -ub` *every* ubatch is
+"the last large ubatch" and calls `moe_cache_seed_begin`; the first one has no stored routing yet, so `moe_cache_seed = true`
+-> `sched_copy_all_experts` false -> `GGML_BACKEND_SCHED_PREFETCH_SYNC`. Later ubatches seed from the previous routing
+(`moe_cache_seed_prev`, async). 30k prompt, `-ub 8192`, depth 4, 16 GB cache:
+
+| | 30k tok/s | ubatch 1 host time in copy_input |
+|---|---|---|
+| `-b 8192` (default pairing) | 4,067 | 1,944 ms |
+| `-b 8192`, `LLAMA_GRAPH_REUSE_DISABLE=1` | 4,061 | 1,948 ms (not graph reuse) |
+| `-b 32768 -ub 8192` (one batch, only the real last ubatch seeds) | **4,407** | 25 ms |
+| `-b 8192`, `LLAMA_MOE_CACHE_SEED=0` | **4,479** | 25 ms |
+
+So +8-10% at 30k and ~15% at 15k from `-b` larger than `-ub` (costs host RAM for the logits buffer, `n_batch x n_vocab x 4 B`,
+32 GB at `-b 32768`; VRAM unchanged). The proper fix is to seed without reading the ids before the copies: seed from the
+recorded routing after the graph (host -> bank copies of the planned fills only), which also removes the synchronous last
+ubatch.
+
+### What the two knobs do to the best-generation config (`-c 32768 -np 2 -ub 2048 --moe-cache-mib 24000`, MTP-3 stack)
+
+| | prompt 15k | prompt 30k | decode, 89-token prompt, 600 tokens (`scripts/llama_bench_tf.sh`) |
+|---|---|---|---|
+| as is | 2,197 | 2,290 | 164.8 (twice) |
+| `GGML_SCHED_PREFETCH_DEPTH=4` | | | 161.0 (-2.3%) |
+| `-b 32768` | | | 157.3 (-4.6%) |
+| both | 2,287 | 2,519 | 153.6 (-7%) |
+| depth 4, cache 23000 | 2,398 | 2,527 | 161.3 |
+
+So in this layout the cheap knobs are **not generation-neutral**: depth 4 costs ~2% decode even with 1 GB less cache (so it is
+not VRAM pressure; the deeper copy queue changes the small-batch path too), and `-b 32768` costs ~5%. Keep the layout as
+is for generation and get the prompt speed from code changes instead: (1) seed the cache without the synchronous copies
+(the `-b` effect without a bigger batch), (2) apply the deeper prefetch only to large-batch graphs (depth 4 for prompts,
+depth 2 for the decode graphs, same arena), (3) the memory-lending cache so the prompt can use `-ub 8192`+ and stream the
+experts once, (4) the kernel items.
+
+### Plan, in order of value for the generation-neutral goal
+
+1. `GGML_SCHED_PREFETCH_DEPTH=4` (+10-20% prompt) and `-b 32768` (+8-15%) are available now but cost 2% / 5% decode in
+   the 24 GB layout (table above); for a prompt-heavy server they pay, for the generation-first config make them code:
+   seeding without synchronous copies, and a prefetch depth that applies to large graphs only.
+2. Kernel efficiency (memory-neutral, applies at every `-ub`): `mm_ids_helper`
+   once per ids tensor (tile width was tested and is not a lever); MoE gate/up/SwiGLU fusion in MMQ; then the launch gaps (CUDA graph capture of prefill graphs, or
+   fewer splits).
+3. Fewer bytes without losing cache: lend cache memory to the prompt like Strata. Either the growable VMM-backed cache bank
+   from the earlier design (shrink before a large batch, grow back after) or a compute buffer type that carves its memory
+   from the top of the bank after evicting those slots. With that, `-ub 32768` on a 32k context streams the experts once
+   and llama.cpp becomes purely compute-bound (today's kernels: ~4,200 tok/s; with 2. maybe 5,000-5,500).
+
 ## Machine
 
 - RTX 5090 32 GB (driver 610.88, CUDA UMD 13.3).
