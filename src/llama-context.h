@@ -374,6 +374,23 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // per-width graph cache (LLAMA_GRAPH_WIDTH_CACHE=1): small decode ubatches (speculative verifies of 1..width_cache_max tokens) each
+    // keep their own scheduler, compute buffers and graph result, so switching the verify width neither rebuilds the ggml graph nor
+    // re-captures the CUDA graph (the backend keys its graphs by the first node, which stays stable per slot)
+    struct width_slot {
+        ggml_backend_sched_ptr sched;
+        std::array<llm_graph_result_ptr, 2> res;
+        llm_graph_result * active = nullptr;
+    };
+    std::map<uint32_t, width_slot> width_slots;
+    uint32_t width_cache_max = 8;
+    bool width_cache_enabled() const;
+    width_slot & width_slot_get(uint32_t n_tokens);
+    void width_slots_clear();
+
+    // the scheduler of the ubatch being processed: the main one or a width slot's
+    ggml_backend_sched_t sched_cur = nullptr;
+
     bool sched_need_reserve = true;
     bool record_experts_installed = false; // LLAMA_RECORD_EXPERTS, installed at the first decode (not in measurement contexts)
 
