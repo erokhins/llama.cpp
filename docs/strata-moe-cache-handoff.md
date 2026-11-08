@@ -48,7 +48,7 @@ Session date: 2026-11-02. Everything lives under `C:\Users\erokh\testing\` unles
     Binary: `src\llama-merge\build\bin\llama-server.exe`.
   - MSVC pitfalls: `GGML_NATIVE=ON` adds no `/arch` flags (decode 4x slower); pass AVX-512 flags explicitly;
     `GGML_AVX512_BF16` does not compile; copy the three CUDA DLLs next to the exe.
-- **Results** (`scripts/run_bin.sh`, bench over 127.0.0.1, server-side prompt tok/s; `builds-bench/`):
+- **Results** (`scripts/moe-bench/run_bin.sh`, bench over 127.0.0.1, server-side prompt tok/s; `builds-bench/`):
 
   | Config | Gen | Gen after 30k | Prompt 30k | TTFT 30k | 4 requests |
   |---|---|---|---|---|---|
@@ -67,7 +67,7 @@ Session date: 2026-11-02. Everything lives under `C:\Users\erokh\testing\` unles
     **New best single-user and multi-user config: `--moe-cache-mib 12288` without MTP on the merged build.**
     A bigger cache no longer costs prompt speed (the prefetch hides the expert stream), so 12 GB beats 8 GB everywhere.
   - Gap to Strata is now 2.0x decode, 2.2x prompt, 1.1x concurrent (was 2.1x, 4.6x, 1.5x).
-  - The cache hit statistics are still not captured: llama-server only logs them on Ctrl-C and `scripts/srv.py`'s
+  - The cache hit statistics are still not captured: llama-server only logs them on Ctrl-C and `scripts/moe-bench/srv.py`'s
     console Ctrl-C did not reach it (falls back to force kill).
 
 ## Update, 2026-11-02 night: where the decode time goes, and the one kernel fix that paid
@@ -101,13 +101,13 @@ Goal was "cut kernel count per layer for 30-40% decode". Result: **not available
 - **Diagnostics added to the merged tree (env-gated, off by default):** `GGML_CUDA_KERNEL_STATS=1` (dispatched op
   histogram + CUDA graph node counts), `GGML_CUDA_OP_TIMING=1` (per-op GPU time on replays 50, 150, ...), a periodic
   MoE-cache hit-rate log every 1000 decodes, and `TEST_QWEN4EXP_SHAPES=1` perf cases in `test-backend-ops`. All need `-lv 4`.
-- Tools: `scripts/quick_hit.sh` (4x512 tokens, hit-rate log), `scripts/quick_pp.sh` (one 30k prompt).
+- Tools: `scripts/moe-bench/quick_hit.sh` (4x512 tokens, hit-rate log), `scripts/moe-bench/quick_pp.sh` (one 30k prompt).
 
 ## Update, 2026-11-02 late: per-stage comparison of one decode step, llama.cpp vs Strata
 
 Method: llama.cpp `GGML_CUDA_OP_TIMING=2 -lv 4` (CUDA event nodes at stage boundaries inside the replayed graph, replay 250,
 12 GB cache, no MTP), corrected by subtracting the measured ~8.5 us event overhead per segment. Strata in bench mode
-(`scripts/strata_stage_bench.sh`, `STRATA_VERIFY_PROFILE=1 STRATA_SPEC_T_CYCLE=1,5`), its own GPU stamps, 89-token prompt,
+(`scripts/moe-bench/strata_stage_bench.sh`, `STRATA_VERIFY_PROFILE=1 STRATA_SPEC_T_CYCLE=1,5`), its own GPU stamps, 89-token prompt,
 600 tokens. Strata's T1 = a verify window of one token, i.e. a plain non-speculative step.
 
 | Stage (ms per 1-token step) | llama.cpp | Strata T1 |
@@ -215,7 +215,7 @@ verify of up to 5 tokens (about 22 ms, 2x a single token). Strata's 5-token wind
   processing 2,566 vs 2,568 tok/s, generation 104.3 vs 104.4 tok/s. At 128k / 4 slots with MTP (both contexts shrink,
   target to 470 MiB and draft to 339 MiB): 31,862 -> 28,900 MiB (-3.0 GB) during generation, prompt 1,990 tok/s,
   generation 103-109 tok/s; a second prompt regrows correctly (the full reservation takes 7-90 ms). The freed VRAM is
-  just free: nothing uses it yet. `scripts/paw_test.sh` is the check, log lines need `-lv 4`.
+  just free: nothing uses it yet. `scripts/moe-bench/paw_test.sh` is the check, log lines need `-lv 4`.
 - **To let the expert cache use it (not implemented, est. 1-2 days):** the cache bank is a fixed `cudaMalloc`, so it
   needs (1) the bank allocated from a CUDA virtual-memory reservation (`cuMemAddressReserve` + `cuMemMap`, primitives in
   `ggml_cuda_pool_vmm`) so it grows and shrinks in place and stays contiguous for `mul_mat_id`; (2)
@@ -234,8 +234,8 @@ Setup: the 20 GB layout (`-c 32768 -np 2 -b 2048 -ub 2048`, no MTP), three bench
 llama.cpp recorded every routed expert id (`LLAMA_RECORD_EXPERTS`, a `cb_eval` on `ffn_moe_topk-*`) and its
 resident set at every hit-rate log (`LLAMA_MOE_CACHE_DUMP`); Strata ran the same prompts with
 `--expert-profile-save`, whose output lists its resident experts first. Caches were the same size: llama.cpp 12,079
-slots (23.6 GB), Strata 12,289 slots (23.3 GiB). Tools: `scripts/expert_trace.sh`, `scripts/strata_trace.sh`,
-`scripts/expert_analysis.py`, data in `builds-bench/experts-cold.bin`, `resident-cold.bin`, `strata-profile-after.bin`.
+slots (23.6 GB), Strata 12,289 slots (23.3 GiB). Tools: `scripts/moe-bench/expert_trace.sh`, `scripts/moe-bench/strata_trace.sh`,
+`scripts/moe-bench/expert_analysis.py`, data in `builds-bench/experts-cold.bin`, `resident-cold.bin`, `strata-profile-after.bin`.
 
 | | llama.cpp (CLOCK, cold start) | Strata (profile-seeded, adaptive) | static oracle, same slot count |
 |---|---|---|---|
@@ -259,8 +259,8 @@ slots (23.6 GB), Strata 12,289 slots (23.3 GiB). Tools: `scripts/expert_trace.sh
 
 Setup: the 20 GB layout (`-c 32768 -np 2 -b 2048 -ub 2048 --moe-cache-mib 24576`), 2 x 256 tokens, Nsight Systems
 2026.3.2 (per-user install under `tools\nsys`, `--cuda-graph-trace=node` so kernels inside CUDA graphs are traced
-individually). Tools: `scripts/nsys_decode.sh NAME [server args]` (profile + CSV export; the server writes its own
-`--log-file`, nsys swallows its stdout), `scripts/nsys_steps.py TRACE.csv` (segments = graph replays, per-step
+individually). Tools: `scripts/moe-bench/nsys_decode.sh NAME [server args]` (profile + CSV export; the server writes its own
+`--log-file`, nsys swallows its stdout), `scripts/moe-bench/nsys_steps.py TRACE.csv` (segments = graph replays, per-step
 busy/idle, kernel families). Data: `builds-bench/nsys-plain*.{nsys-rep,csv}`, `nsys-mtp4*`. Under the profiler the
 server ran at its normal speed (100 tok/s plain, 105 tok/s MTP4), so the traces are representative. Note: nsys
 reports kernel durations that overlap slightly inside a graph, so "sum of kernel time" exceeds wall time by ~10%;
@@ -304,7 +304,7 @@ rollback snapshot copies (1.6 ms, `ggml_cont` + `ggml_cpy` per slot; a direct st
 (3) Drafting costs 3 ms of GPU plus ~2 ms of CPU per round because each of the 4 draft steps is a separate decode
 with a full-vocabulary head; Strata's vocab-subset head and single captured round avoid both.
 
-**Fixes applied (commit 7ad8dae47 in `src\llama-merge`), measured in the 20 GB layout with `scripts/quick_hit.sh`
+**Fixes applied (commit 7ad8dae47 in `src\llama-merge`), measured in the 20 GB layout with `scripts/moe-bench/quick_hit.sh`
 (4 x 512 tokens, MTP flags `-md mtp/...Q8_0.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-n-ubatch 64`):**
 
 | build | MTP-4 tok/s | plain decode tok/s |
@@ -325,7 +325,7 @@ draft side: 4 full-vocabulary heads (1.6 ms) and 4 separate decodes with their C
 
 ## Update, 2026-11-03: MTP head-to-head on the same prompts, and why Strata misses fewer experts
 
-Same three 1024-token prompts (`scripts/mtp_trace.sh` for llama.cpp, `scripts/strata_trace.sh` for Strata), 20 GB-class
+Same three 1024-token prompts (`scripts/moe-bench/mtp_trace.sh` for llama.cpp, `scripts/moe-bench/strata_trace.sh` for Strata), 20 GB-class
 expert cache on both, commit 7ad8dae47. Logs: `builds-bench/mtptrace-pmin0.log`, `mtptrace-pmin05.log`,
 `compare-mtp-run.txt`, Strata's `launch\iq3_s-trace.engine.log`.
 
@@ -376,7 +376,7 @@ Both are opt-in through environment variables (the server reads them at start):
   (waits for the copy), then the missing experts, and adds the two. Exact: same experts, same weights. A CUDA graph
   chunk cannot end between fork and join (`moe_fork_open`).
 
-**Tail skip, plain decode, teacher-forced 2,958 positions (`scripts/teacher_force.py`, exact vs skip 7):**
+**Tail skip, plain decode, teacher-forced 2,958 positions (`scripts/moe-bench/teacher_force.py`, exact vs skip 7):**
 
 | | exact | skip 7 |
 |---|---|---|
@@ -388,7 +388,7 @@ Both are opt-in through environment variables (the server reads them at start):
 That is the same distance as between llama.cpp and Strata (0.0033, 97.6%), and the same as Strata reports for its own
 skip. In plain decode the skip halves the misses; speed numbers for MTP are below.
 
-**Speed (commit 9a9f82d2d, same three 1024-token prompts, `scripts/mtp_trace.sh`; plain via `quick_hit.sh`):**
+**Speed (commit 9a9f82d2d, same three 1024-token prompts, `scripts/moe-bench/mtp_trace.sh`; plain via `quick_hit.sh`):**
 
 | | plain decode tok/s | MTP-4 tok/s (3 prompts) | misses in MTP (3 prompts) |
 |---|---|---|---|
@@ -410,7 +410,7 @@ skip. In plain decode the skip halves the misses; speed numbers for MTP are belo
 
 ## Update, 2026-11-03: ablation of Strata's two miss tricks, same prompt on both engines
 
-Bench mode on both sides (`scripts/strata_bench.sh`, `scripts/llama_bench_tf.sh`): the 89-token teacher-forcing prompt,
+Bench mode on both sides (`scripts/moe-bench/strata_bench.sh`, `scripts/moe-bench/llama_bench_tf.sh`): the 89-token teacher-forcing prompt,
 600 greedy tokens, Strata `--spec 4 --spec-min-p 0.5`, llama.cpp MTP-4 fixed width, 20 GB-class caches. Strata's
 `--no-pool` exits with code 2 in this configuration, so "no CPU compute" is `--pcie-frac 1.0` (every miss read by the
 GPU over PCIe, as llama.cpp does). Logs: `builds-bench/strata-bench-*.log`, `llama-bench-*.log`, `*-ablation.txt`.
@@ -491,7 +491,7 @@ Branch pushed: `https://github.com/erokhins/llama.cpp` branch `moe-cache-perf` (
 
 Per round the draft side cost 2.8 ms of GPU (4 draft steps of 0.61 ms, 0.39 of each the 248k-vocabulary head GEMV) plus
 CPU work per step (logits copy to the host, sampling). Same 89-token prompt, 600 tokens, exact unless noted
-(`scripts/llama_bench_tf.sh`, logs `builds-bench/llama-bench-*.log`, `draftopt-run*.txt`):
+(`scripts/moe-bench/llama_bench_tf.sh`, logs `builds-bench/llama-bench-*.log`, `draftopt-run*.txt`):
 
 | setting (4 drafts unless noted) | tok/s | accepted / generated |
 |---|---|---|
@@ -586,9 +586,9 @@ Proposals, in order of value per effort:
 
 ## Update, 2026-11-03: prompt processing (prefill), why llama.cpp reads prompts 2x slower than Strata
 
-Tools added: `scripts/pp_bench.py` (prefill-only: 1k/4k/15k/30k prompts, unique prefixes, server-side `prompt_ms`),
-`scripts/pp_run.sh BIN_DIR NAME [server flags]` (start, bench, graceful stop; `PP_SIZES=chars,...`), `scripts/nsys_prefill.sh`
-+ `scripts/nsys_prefill.py` (Nsight trace of one prompt: copy-vs-compute breakdown, `--timeline 100`), `scripts/pcie_bench.cu`
+Tools added: `scripts/moe-bench/pp_bench.py` (prefill-only: 1k/4k/15k/30k prompts, unique prefixes, server-side `prompt_ms`),
+`scripts/moe-bench/pp_run.sh BIN_DIR NAME [server flags]` (start, bench, graceful stop; `PP_SIZES=chars,...`), `scripts/moe-bench/nsys_prefill.sh`
++ `scripts/moe-bench/nsys_prefill.py` (Nsight trace of one prompt: copy-vs-compute breakdown, `--timeline 100`), `scripts/moe-bench/pcie_bench.cu`
 (pinned H2D microbenchmark). Server-side prompt tok/s unless noted. Strata measured the same day with the same script.
 
 ### Measurements
@@ -608,7 +608,7 @@ Tools added: `scripts/pp_bench.py` (prefill-only: 1k/4k/15k/30k prompts, unique 
 Memory (`-lv 4`): `-ub 8192 -c 32768` compute buffer 4,214 MiB CUDA + 531 MiB host (about 0.5 MiB per ubatch token);
 host experts 43.6 GB pinned (`CUDA_Host model buffer`), staging arena 794 MiB at depth 2 (2 x largest split 450 MiB).
 
-PCIe (`scripts/pcie_bench.cu`, RTX 5090 at PCIe 5.0 x16): pinned H2D 56.7 GB/s for 1 GiB, 46.5 GB/s in 627 KB pieces,
+PCIe (`scripts/moe-bench/pcie_bench.cu`, RTX 5090 at PCIe 5.0 x16): pinned H2D 56.7 GB/s for 1 GiB, 46.5 GB/s in 627 KB pieces,
 54.3 GB/s with `cudaMemcpyBatchAsync`, 17.6 GB/s from pageable memory. llama.cpp's uploads run at **57.1 GB/s effective**
 (Nsight), so the link is used at full speed; the problem is not the copy rate.
 
@@ -688,7 +688,7 @@ ubatch.
 
 ### What the two knobs do to the best-generation config (`-c 32768 -np 2 -ub 2048 --moe-cache-mib 24000`, MTP-3 stack)
 
-| | prompt 15k | prompt 30k | decode, 89-token prompt, 600 tokens (`scripts/llama_bench_tf.sh`) |
+| | prompt 15k | prompt 30k | decode, 89-token prompt, 600 tokens (`scripts/moe-bench/llama_bench_tf.sh`) |
 |---|---|---|---|
 | as is | 2,197 | 2,290 | 164.8 (twice) |
 | `GGML_SCHED_PREFETCH_DEPTH=4` | | | 161.0 (-2.3%) |
@@ -726,7 +726,7 @@ by the gate and up nodes, an 8-warp `mm_ids_helper`, and a note that stream-k of
 GDN prefill kernel is gfx11-only. Note that our fork already serves cached experts to large batches by device-to-device
 copies (`copy_regions_kernel`, 3.6% of the bestgen GPU time), so the in-place read saves SM copy time, not PCIe bytes.
 
-Measured one change at a time with `scripts/pp_step.sh STEP` (prompts of 15k, 30k, 30k tokens; `bestgen` = `-ub 2048`,
+Measured one change at a time with `scripts/moe-bench/pp_step.sh STEP` (prompts of 15k, 30k, 30k tokens; `bestgen` = `-ub 2048`,
 24 GB cache, MTP-3; `c128k` = `-ub 4096`, 12 GB cache, `-c 131072`); server-side tok/s at 30k (the two runs):
 
 | step | bestgen | c128k | kept |
@@ -738,7 +738,7 @@ Measured one change at a time with `scripts/pp_step.sh STEP` (prompts of 15k, 30
 | + prefetch depth 4 for prefetched graphs only (`GGML_SCHED_PREFETCH_DEPTH_LARGE=4`) | 2,556 / 2,575 | 3,974 / 4,052 | +13-15% bestgen, +19-22% c128k, but -2.3% decode (below) |
 | + prefetch depth 3 for prefetched graphs only (**default**) | **2,497 / 2,529** | **3,753 / 3,826** | yes: +11-13% bestgen, +13-15% c128k, -1% decode |
 
-Decode check (`scripts/llama_bench_tf.sh`, 24 GB layout request, MTP-3, 600 tokens, two runs each): old behaviour
+Decode check (`scripts/moe-bench/llama_bench_tf.sh`, 24 GB layout request, MTP-3, 600 tokens, two runs each): old behaviour
 148.7 / 148.5 tok/s, depth 3 for prompts 146.9 / 147.2, depth 4 144.7 / 145.6. The loss is not the pipeline: the staging
 arena is `depth` x the largest expert tensor copy (450 MiB), 0.8 GB at depth 2, 1.35 GB at 3, 1.8 GB at 4, and the memory
 fit takes it from the expert cache (19,497 -> 18,941 -> 18,493 MiB in the log), ~1% of decode per 450 MiB. The deferred
@@ -787,11 +787,11 @@ what is missing is the cache growing into the freed VRAM (fixed `cudaMalloc`, si
 
 ## Update, 2026-11-03: Strata vs llama.cpp prefill at equal chunk size, stage by stage
 
-Tooling: `scripts/strata_pp_engine.py NAME [sizes] -- [engine args]` drives `strata.exe --serve` over its stdin protocol
+Tooling: `scripts/moe-bench/strata_pp_engine.py NAME [sizes] -- [engine args]` drives `strata.exe --serve` over its stdin protocol
 (`GEN 1 <ids>`; the HTTP server is the Strata terminal's Python, `strata.exe --serve` alone is a stdin/stdout engine that
 exits on EOF) with `STRATA_PREFILL_TIMING=1`, which prints the engine's own per-phase GPU timeline per prompt chunk
 (`strata prefill timing: ...` on stderr; a layer-major timeline, waits charged to the waiting phase). Prompts are the
-pp_bench corpus tokenized with `llama-tokenize` (same vocabulary). llama.cpp side: `scripts/nsys_prefill.sh` +
+pp_bench corpus tokenized with `llama-tokenize` (same vocabulary). llama.cpp side: `scripts/moe-bench/nsys_prefill.sh` +
 `nsys_prefill.py` (kernel families). Files: `builds-bench/strata-pp-*.json/.engine.log`, `builds-bench/nsys-ub8k-stage*`.
 
 ### Chunk size sweep, same prompts (tok/s from wall time, 15k / 30k prompt; Strata = `--prefill N`, llama.cpp = `-ub N`)
@@ -956,7 +956,7 @@ Searched the Unsloth fork (346 PRs) and upstream for the open items of the prefi
 
 - Prebuilt mainline **b11960** (= v0.8.0), Windows CUDA 13.4 x64, in `llamacpp-b11960\bin\`.
   Zip SHA-256s were verified against GitHub's digests.
-- Base command used for every run (see `scripts/run_config.sh`):
+- Base command used for every run (the old `run_config.sh`, since removed; `run_bin.sh` uses the same base):
 
   ```
   llama-server.exe -m <shard1.gguf> --host 0.0.0.0 --port 8080 --api-key <key> --alias qwen3.8-flash-next-iq3_s \
@@ -971,7 +971,7 @@ Searched the Unsloth fork (346 PRs) and upstream for the open items of the prefi
 
 ## Results
 
-### Throughput (`scripts/bench.py`; tok/s)
+### Throughput (`scripts/moe-bench/bench.py`; tok/s)
 
 | Config | Gen, short prompt | Gen after 30k prompt | Prompt read, 30k | 4 requests at once |
 |---|---|---|---|---|
@@ -1013,9 +1013,9 @@ Searched the Unsloth fork (346 PRs) and upstream for the open items of the prefi
 - **Static:**
   - Strata reads experts and quantized dense tensors directly from the GGUF, by byte offset.
   - All 777 BF16/F32 tensors it copies into `packs\iq3_s\dense.bin` are byte-identical to the GGUF
-    (`scripts/verify_pack.py`).
+    (`scripts/moe-bench/verify_pack.py`).
   - Its chat template is identical to the GGUF's.
-- **Free greedy generation** (`scripts/gen_compare.py`, 8 prompts, temperature 0, compared after whitespace trim):
+- **Free greedy generation** (`scripts/moe-bench/gen_compare.py`, 8 prompts, temperature 0, compared after whitespace trim):
 
   | Pair | Identical outputs |
   |---|---|
@@ -1026,7 +1026,7 @@ Searched the Unsloth fork (346 PRs) and upstream for the open items of the prefi
 
   Divergences always start at near-ties. Factual answers were identical in all runs. Strata keeps a trailing `\n` on
   reasoning text and llama.cpp strips it, so compare after trimming.
-- **Teacher-forced next token** (`scripts/teacher_force.py`):
+- **Teacher-forced next token** (`scripts/moe-bench/teacher_force.py`):
   - Setup: an 89-token prompt plus a 2,958-token greedy reference. Every prefix was fed to both engines as raw token
     IDs, and each returned its top-20 log-probabilities.
 
@@ -1059,38 +1059,32 @@ Searched the Unsloth fork (346 PRs) and upstream for the open items of the prefi
 
 ## Files
 
+Layout since 2026-11-08: this repo (branch `moe-cache-perf`) lives in `C:\Users\erokh\testing\src\llama.cpp`, built in
+`build\`. The older worktrees (`src\llama-merge`, `src\llama-ab`, `src\llama-base`, `src\llama-pr268`), the prebuilt b11960
+release and the raw logs/traces in `builds-bench\` referenced above were deleted; their numbers are in this document. Older
+sections still name `src\llama-merge`: read that as this repo.
+
 | Path | What |
 |---|---|
-| `scripts/bench.py` | throughput benchmark (decode, prefill at 4k/15k/30k, long-context decode, 4-request concurrency) |
-| `scripts/run_config.sh NAME [flags]` | start llama.cpp with the base config plus flags, benchmark it, leave it running |
-| `scripts/gen_compare.py` | free greedy generation, collect and compare (`nolp` arg for Strata) |
-| `scripts/teacher_force.py` | `ref` / `llama` / `strata` / `compare` teacher-forced pipeline |
-| `scripts/verify_pack.py` | byte-compare Strata's `dense.bin` against the GGUF |
-| `scripts/gguf_info.py` | GGUF header and tensor-type dump |
-| `scripts/run_bin.sh BIN_DIR NAME [flags]` | like run_config.sh for any build dir; 127.0.0.1; output in `builds-bench/` |
-| `scripts/quick_tg.sh BIN_DIR NAME [flags]` | 1-minute decode sanity check of a build |
-| `scripts/srv.py` | start/stop helper used by the two scripts above |
-| `scripts/compare.py LABEL=results.json ...` | side-by-side table of bench results |
-| `src/llama-merge/` | **PR #268 merged onto b11960, the build to use**; `src/llama-base`, `src/llama-pr268`: A/B trees |
+| `scripts/moe-bench/` | all benchmark/profiling scripts named in this document (`bench.py`, `run_bin.sh`, `llama_bench_tf.sh`, `pp_*.sh`, `nsys_*`, `*_trace.sh`, `teacher_force.py`, `requant_mtp_q2_0.py`, `pcie_bench.cu`, ...) |
+| `scripts/moe-bench/tf-ref.json` | the 89-token teacher-forcing prompt and greedy reference used by the decode benches |
+| `scripts/moe-bench/srv.py` | start/stop helper used by the shell scripts |
+| `C:\Users\erokh\testing\mtp\mtp-Qwen3.8-Flash-Next-Q8_0.gguf` | MTP draft head (the only one kept; other quants are reproducible with `llama-quantize` / `requant_mtp_q2_0.py`) |
+| `C:\Users\erokh\testing\builds-bench\` | output dir of the scripts (recreated on demand; override the base with `BENCH_DATA`) |
 | `C:\Users\erokh\tools\` | per-user MSVC/CUDA/CMake toolchain, `buildenv.sh`, `fetch_msvc.py` |
-| `builds-bench/results-*.json`, `builds-bench/server-*.log` | this update's benchmark outputs and logs |
-| `results-strata.json`, `results-llamacpp-*.json` | benchmark outputs |
-| `gen/*.json` | free-generation outputs |
-| `tf/ref.json`, `tf/llama.json`, `tf/llama-2.json`, `tf/strata.json` | teacher-forcing data |
-| `llamacpp-b11960/server-*.log` | llama.cpp server logs, one per config |
-| `mtp/mtp-Qwen3.8-Flash-Next-Q8_0.gguf` | MTP draft head for llama.cpp |
+
+Script environment: `BENCH_DATA` (data dir, default `C:/Users/erokh/testing`), `BENCH_API_KEY` (default `sk-local`;
+set it to Strata's key for the scripts that talk to the Strata HTTP server), `BIN` (other llama-server build for A/B).
 
 ## How to start things
 
 - **Strata:** `strata.py runtime start --profile launch-iq3_s-128k --wait 1800` (full path above); ~30 s.
-- **llama.cpp, best config now (PR #268 on b11960, no MTP):**
-  `bash scripts/run_bin.sh C:/Users/erokh/testing/src/llama-merge/build/bin NAME --moe-cache-mib 12288`
-  runs the benchmark and stops the server. To only serve, copy the command from `scripts/run_bin.sh`
-  (`--host 127.0.0.1`). Env knobs of the PR: `GGML_SCHED_PREFETCH=0`, `LLAMA_MOE_CACHE_DEVICE=0`, `LLAMA_MOE_CACHE_SEED=0`.
-  Rebuild after source changes: `source /c/Users/erokh/tools/buildenv.sh; ninja -C src/llama-merge/build llama-server`.
-- **llama.cpp prebuilt b11960, old best single-user config:**
-  `bash scripts/run_config.sh mycfg --moe-cache-mib 8192 -md C:/Users/erokh/testing/mtp/mtp-Qwen3.8-Flash-Next-Q8_0.gguf --spec-type draft-mtp --spec-draft-n-max 2`.
-  This also runs the benchmark. To start it without benchmarking, copy the base command above.
+- **llama.cpp, best generation config (MTP-3, exact):**
+  `LLAMA_MTP_VOCAB=98304 LLAMA_GRAPH_WIDTH_CACHE=1 GGML_CUDA_GRAPH_WARMUP=0 LLAMA_KV_PAD=2048 bash scripts/moe-bench/llama_bench_tf.sh NAME --spec-draft-n-max 3 --backend-sampling --spec-draft-backend-sampling`
+  (add `LLAMA_MOE_CACHE_TAIL_SKIP=7` for the approximate mode). Full benchmark of any build:
+  `bash scripts/moe-bench/run_bin.sh build/bin NAME [flags]`; prefill on the two reference configs: `scripts/moe-bench/pp_step.sh STEP`.
+  To only serve, copy the server command from these scripts (`--host 127.0.0.1`, never `localhost`).
+  Rebuild after source changes: `source /c/Users/erokh/tools/buildenv.sh; ninja -C build llama-server`.
 - Only one engine fits on the GPU at a time. Stop one before starting the other: `taskkill //IM llama-server.exe //F`,
   or `runtime stop` for Strata.
 
