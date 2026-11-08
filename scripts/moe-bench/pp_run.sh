@@ -5,7 +5,7 @@
 # server's prompt timing lines, stops the server gracefully. Output: builds-bench/pp-NAME.json, builds-bench/pp-NAME.log
 set -u
 BINDIR=$1; NAME=$2; shift 2
-T=${BENCH_DATA:-C:/Users/erokh/testing}   # data dir: outputs go to $T/builds-bench, draft heads live in $T/mtp
+T=${BENCH_DATA:-C:/Users/erokh/qwen3.8-flash-next}   # data dir: outputs go to $T/builds-bench, draft head in $T/models
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); R=$(cd "$D/../.." && pwd)   # script dir, repo root
 BIN=$BINDIR/llama-server.exe
 M=C:/Users/erokh/AppData/Local/Strata/Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf

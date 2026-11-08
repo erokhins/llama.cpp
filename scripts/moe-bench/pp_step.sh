@@ -6,11 +6,11 @@
 # Output: builds-bench/pp-STEP-CONFIG.{json,log}; prints one line per prompt (server tok/s).
 set -u
 STEP=$1; shift
-T=${BENCH_DATA:-C:/Users/erokh/testing}   # data dir: outputs go to $T/builds-bench, draft heads live in $T/mtp
+T=${BENCH_DATA:-C:/Users/erokh/qwen3.8-flash-next}   # data dir: outputs go to $T/builds-bench, draft head in $T/models
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); R=$(cd "$D/../.." && pwd)   # script dir, repo root
 B=$R/build/bin
 export PP_SIZES=${PP_SIZES:-56000,112000,112000}
-MTP="-md $T/mtp/mtp-Qwen3.8-Flash-Next-Q8_0.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-ubatch 64 --backend-sampling --spec-draft-backend-sampling"
+MTP="-md $T/models/mtp-Qwen3.8-Flash-Next-Q8_0.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-ubatch 64 --backend-sampling --spec-draft-backend-sampling"
 for cfg in ${CONFIGS:-bestgen c128k}; do
   echo "=== $STEP $cfg"
   case $cfg in

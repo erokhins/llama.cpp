@@ -1059,8 +1059,10 @@ Searched the Unsloth fork (346 PRs) and upstream for the open items of the prefi
 
 ## Files
 
-Layout since 2026-11-08: this repo (branch `moe-cache-perf`) lives in `C:\Users\erokh\testing\src\llama.cpp`, built in
-`build\`. The older worktrees (`src\llama-merge`, `src\llama-ab`, `src\llama-base`, `src\llama-pr268`), the prebuilt b11960
+Layout since 2026-11-08: everything lives in `C:\Users\erokh\qwen3.8-flash-next\`: this repo (branch `moe-cache-perf`)
+in `llama.cpp\` (built in `llama.cpp\build\`), `start.llama.ps1` (starts the server; settings incl. API key at its top),
+`models\` (MTP draft head). The main model stays in Strata's folder (path in `start.llama.ps1`). Paths elsewhere in this
+document under `C:\Users\erokh\testing\` are historical. The older worktrees (`src\llama-merge`, `src\llama-ab`, `src\llama-base`, `src\llama-pr268`), the prebuilt b11960
 release and the raw logs/traces in `builds-bench\` referenced above were deleted; their numbers are in this document. Older
 sections still name `src\llama-merge`: read that as this repo.
 
@@ -1069,16 +1071,18 @@ sections still name `src\llama-merge`: read that as this repo.
 | `scripts/moe-bench/` | all benchmark/profiling scripts named in this document (`bench.py`, `run_bin.sh`, `llama_bench_tf.sh`, `pp_*.sh`, `nsys_*`, `*_trace.sh`, `teacher_force.py`, `requant_mtp_q2_0.py`, `pcie_bench.cu`, ...) |
 | `scripts/moe-bench/tf-ref.json` | the 89-token teacher-forcing prompt and greedy reference used by the decode benches |
 | `scripts/moe-bench/srv.py` | start/stop helper used by the shell scripts |
-| `C:\Users\erokh\testing\mtp\mtp-Qwen3.8-Flash-Next-Q8_0.gguf` | MTP draft head (the only one kept; other quants are reproducible with `llama-quantize` / `requant_mtp_q2_0.py`) |
-| `C:\Users\erokh\testing\builds-bench\` | output dir of the scripts (recreated on demand; override the base with `BENCH_DATA`) |
+| `C:\Users\erokh\qwen3.8-flash-next\start.llama.ps1` | starts llama-server; default = long-context profile (128k, 4 slots, 12 GB cache), `$UseMtp` / `$TailSkip` switches |
+| `C:\Users\erokh\qwen3.8-flash-next\models\mtp-Qwen3.8-Flash-Next-Q8_0.gguf` | MTP draft head (the only one kept; other quants are reproducible with `llama-quantize` / `requant_mtp_q2_0.py`) |
+| `C:\Users\erokh\qwen3.8-flash-next\builds-bench\` | output dir of the scripts (recreated on demand; override the base with `BENCH_DATA`) |
 | `C:\Users\erokh\tools\` | per-user MSVC/CUDA/CMake toolchain, `buildenv.sh`, `fetch_msvc.py` |
 
-Script environment: `BENCH_DATA` (data dir, default `C:/Users/erokh/testing`), `BENCH_API_KEY` (default `sk-local`;
+Script environment: `BENCH_DATA` (data dir, default `C:/Users/erokh/qwen3.8-flash-next`), `BENCH_API_KEY` (default `sk-local`;
 set it to Strata's key for the scripts that talk to the Strata HTTP server), `BIN` (other llama-server build for A/B).
 
 ## How to start things
 
 - **Strata:** `strata.py runtime start --profile launch-iq3_s-128k --wait 1800` (full path above); ~30 s.
+- **llama.cpp server for daily use:** `C:\Users\erokh\qwen3.8-flash-next\start.llama.ps1` (foreground, Ctrl+C stops).
 - **llama.cpp, best generation config (MTP-3, exact):**
   `LLAMA_MTP_VOCAB=98304 LLAMA_GRAPH_WIDTH_CACHE=1 GGML_CUDA_GRAPH_WARMUP=0 LLAMA_KV_PAD=2048 bash scripts/moe-bench/llama_bench_tf.sh NAME --spec-draft-n-max 3 --backend-sampling --spec-draft-backend-sampling`
   (add `LLAMA_MOE_CACHE_TAIL_SKIP=7` for the approximate mode). Full benchmark of any build:

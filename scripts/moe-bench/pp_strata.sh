@@ -5,7 +5,7 @@
 # the default --prefill auto:32768). Output: builds-bench/pp-strata-NAME.{json,log}
 set -u
 NAME=$1; shift
-T=${BENCH_DATA:-C:/Users/erokh/testing}   # data dir: outputs go to $T/builds-bench, draft heads live in $T/mtp
+T=${BENCH_DATA:-C:/Users/erokh/qwen3.8-flash-next}   # data dir: outputs go to $T/builds-bench, draft head in $T/models
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); R=$(cd "$D/../.." && pwd)   # script dir, repo root
 S=C:/Users/erokh/AppData/Local/Strata
 EXE=$S/components/engine/0.1.55-windows-x86_64-cuda-cuda13/strata.exe

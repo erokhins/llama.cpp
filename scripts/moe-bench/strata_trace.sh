@@ -5,7 +5,7 @@ set -u
 PY=C:/Users/erokh/AppData/Local/Strata/terminal/current/python/python.exe
 S=C:/Users/erokh/AppData/Local/Strata/terminal/current/strata.py
 KEY=${BENCH_API_KEY:-sk-local}   # Strata server: set BENCH_API_KEY to its key
-T=${BENCH_DATA:-C:/Users/erokh/testing}
+T=${BENCH_DATA:-C:/Users/erokh/qwen3.8-flash-next}
 rm -f $T/builds-bench/strata-profile-after.bin
 taskkill //IM llama-server.exe //F >/dev/null 2>&1
 "$PY" "$S" runtime start --profile launch-iq3_s-trace --wait 600 2>&1 | tail -1

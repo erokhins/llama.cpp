@@ -5,7 +5,7 @@
 # writes builds-bench/nsys-NAME.nsys-rep; then the kernel summary and a steady-state per-step breakdown are printed.
 set -u
 NAME=$1; shift
-T=${BENCH_DATA:-C:/Users/erokh/testing}   # data dir: outputs go to $T/builds-bench, draft heads live in $T/mtp
+T=${BENCH_DATA:-C:/Users/erokh/qwen3.8-flash-next}   # data dir: outputs go to $T/builds-bench, draft head in $T/models
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); R=$(cd "$D/../.." && pwd)   # script dir, repo root
 BIN=$R/build/bin/llama-server.exe
 NSYS=$(find /c/Users/erokh/tools/nsys -path "*target-windows-x64*" -iname nsys.exe | head -1)

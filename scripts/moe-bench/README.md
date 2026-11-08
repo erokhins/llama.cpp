@@ -7,7 +7,7 @@ RTX 5090 / Windows / Git Bash. What each script measures, how to read its output
 Paths to the model and to Strata are hard-coded for the original machine (`C:/Users/erokh/...`); edit `M=` / `S=` lines
 to run elsewhere. Environment:
 
-- `BENCH_DATA` — data dir (default `C:/Users/erokh/testing`): outputs go to `$BENCH_DATA/builds-bench`, the MTP draft head is read from `$BENCH_DATA/mtp`.
+- `BENCH_DATA` — data dir (default `C:/Users/erokh/qwen3.8-flash-next`, the folder holding this repo): outputs go to `$BENCH_DATA/builds-bench`, the MTP draft head is read from `$BENCH_DATA/models`.
 - `BENCH_API_KEY` — API key passed to llama-server (default `sk-local`); set it to Strata's key for scripts that talk to the Strata HTTP server.
 - `BIN` — another `llama-server.exe` for same-session A/B (`llama_bench_tf.sh`).
 

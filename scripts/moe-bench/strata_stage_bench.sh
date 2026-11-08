@@ -6,7 +6,7 @@ set -u
 NAME=$1; shift
 S=C:/Users/erokh/AppData/Local/Strata
 EXE=$S/components/engine/0.1.55-windows-x86_64-cuda-cuda13/strata.exe
-D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); T=${BENCH_DATA:-C:/Users/erokh/testing}
+D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); T=${BENCH_DATA:-C:/Users/erokh/qwen3.8-flash-next}
 IDS=$(python -I -c "import json,sys;print(','.join(map(str,json.load(open(sys.argv[1]))['prompt_ids'])))" "$D/tf-ref.json")
 OUT=$T/builds-bench/strata-stage-$NAME.log
 cd "$S/terminal/0.1.55" || exit 1

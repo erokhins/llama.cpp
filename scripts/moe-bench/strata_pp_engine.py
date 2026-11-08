@@ -11,7 +11,7 @@ the engine's timing line.
 """
 import json, os, pathlib, subprocess, sys, time, uuid
 
-T = pathlib.Path(os.environ.get("BENCH_DATA", r"C:\Users\erokh\testing"))
+T = pathlib.Path(os.environ.get("BENCH_DATA", r"C:\Users\erokh\qwen3.8-flash-next"))
 S = pathlib.Path(r"C:\Users\erokh\AppData\Local\Strata")
 EXE = S / r"components\engine\0.1.55-windows-x86_64-cuda-cuda13\strata.exe"
 MODEL = S / r"Strata-data\models\IQ3_S\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"
